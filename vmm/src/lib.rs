@@ -608,7 +608,6 @@ struct Vmm {
     write_metrics_event: EpollEvent<TimerFd>,
 
     // The level of seccomp filtering used. Seccomp filters are loaded before executing guest code.
-    // See `seccomp::SeccompLevel` for more information about seccomp levels.
     seccomp_level: u32,
 }
 
@@ -1976,8 +1975,8 @@ impl PartialEq for VmmAction {
 /// * `api_event_fd` - An event fd used for receiving API associated events.
 /// * `from_api` - The receiver end point of the communication channel.
 /// * `seccomp_level` - The level of seccomp filtering used. Filters are loaded before executing
-///                     guest code.
-///                     See `seccomp::SeccompLevel` for more information about seccomp levels.
+///                     guest code. Can be one of 0 (seccomp disabled), 1 (filter by syscall
+///                     number) or 2 (filter by syscall number and argument values).
 /// * `kvm_fd` - Provides the option of supplying an already existing raw file descriptor
 ///              associated with `/dev/kvm`.
 pub fn start_vmm_thread(
