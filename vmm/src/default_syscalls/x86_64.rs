@@ -279,55 +279,7 @@ pub fn default_context() -> Result<SeccompFilterContext, Error> {
                 ),
             ),
             allow_syscall(libc::SYS_munmap),
-            (
-                libc::SYS_open,
-                (
-                    0,
-                    vec![
-                        SeccompRule::new(vec![], SeccompAction::Allow),
-                        SeccompRule::new(
-                            vec![SeccompCondition::new(1, SeccompCmpOp::Eq, O_RDWR)?],
-                            SeccompAction::Allow,
-                        ),
-                        SeccompRule::new(
-                            vec![SeccompCondition::new(
-                                1,
-                                SeccompCmpOp::Eq,
-                                O_RDWR | O_CLOEXEC,
-                            )?],
-                            SeccompAction::Allow,
-                        ),
-                        SeccompRule::new(
-                            vec![SeccompCondition::new(
-                                1,
-                                SeccompCmpOp::Eq,
-                                O_RDWR | O_NONBLOCK | O_CLOEXEC,
-                            )?],
-                            SeccompAction::Allow,
-                        ),
-                        SeccompRule::new(
-                            vec![SeccompCondition::new(1, SeccompCmpOp::Eq, O_RDONLY)?],
-                            SeccompAction::Allow,
-                        ),
-                        SeccompRule::new(
-                            vec![SeccompCondition::new(
-                                1,
-                                SeccompCmpOp::Eq,
-                                O_RDONLY | O_CLOEXEC,
-                            )?],
-                            SeccompAction::Allow,
-                        ),
-                        SeccompRule::new(
-                            vec![SeccompCondition::new(
-                                1,
-                                SeccompCmpOp::Eq,
-                                O_RDONLY | O_NONBLOCK | O_CLOEXEC,
-                            )?],
-                            SeccompAction::Allow,
-                        ),
-                    ],
-                ),
-            ),
+            allow_syscall(libc::SYS_open),
             allow_syscall(libc::SYS_pipe),
             allow_syscall(libc::SYS_read),
             allow_syscall(libc::SYS_readv),
