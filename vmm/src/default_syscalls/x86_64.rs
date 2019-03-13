@@ -3,7 +3,7 @@
 
 use seccomp::{
     allow_syscall, allow_syscall_if, Error, SeccompAction, SeccompCmpOp::*,
-    SeccompCondition as Cond, SeccompFilter, SeccompRule, SECCOMP_LEVEL_ADVANCED,
+    SeccompCondition as Cond, SeccompFilter, SeccompRule, SyscallRuleset, SECCOMP_LEVEL_ADVANCED,
     SECCOMP_LEVEL_BASIC, SECCOMP_LEVEL_NONE,
 };
 
@@ -104,86 +104,87 @@ pub fn set_seccomp_level(seccomp_level: u32) -> Result<(), Error> {
     // Load seccomp filters before executing guest code.
     // Execution panics if filters cannot be loaded, use --seccomp-level=0 if skipping filters
     // altogether is the desired behaviour.
-    match seccomp_level {
-        SECCOMP_LEVEL_ADVANCED => default_filter()?.apply(),
-        SECCOMP_LEVEL_BASIC => default_filter()?.allow_all().apply(),
-        SECCOMP_LEVEL_NONE | _ => Ok(()),
-    }
+    let ruleset_list = match seccomp_level {
+        SECCOMP_LEVEL_ADVANCED => default_ruleset_list()?,
+        SECCOMP_LEVEL_BASIC => default_ruleset_list()?
+            .iter()
+            .map(|rs| allow_syscall(rs.syscall))
+            .collect(),
+        SECCOMP_LEVEL_NONE | _ => return Ok(()),
+    };
+
+    SeccompFilter::new(ruleset_list, SeccompAction::Trap)?.apply()?;
+    Ok(())
 }
 
 /// The default filter containing the white listed syscall rules required by `Firecracker` to
 /// function.
 ///
-pub fn default_filter() -> Result<SeccompFilter, Error> {
-    Ok(SeccompFilter::new(
-        vec![
-            allow_syscall(libc::SYS_accept),
-            allow_syscall(libc::SYS_brk),
-            allow_syscall(libc::SYS_clock_gettime),
-            allow_syscall(libc::SYS_close),
-            allow_syscall(libc::SYS_dup),
-            allow_syscall_if(
-                libc::SYS_epoll_ctl,
-                or![
-                    and![Cond::new(1, Eq, EPOLL_CTL_ADD)?],
-                    and![Cond::new(1, Eq, EPOLL_CTL_DEL)?],
-                ],
-            ),
-            allow_syscall(libc::SYS_epoll_pwait),
-            allow_syscall(libc::SYS_exit),
-            allow_syscall(libc::SYS_exit_group),
-            allow_syscall_if(
-                libc::SYS_fcntl,
-                or![and![
-                    Cond::new(1, Eq, FCNTL_F_SETFD)?,
-                    Cond::new(2, Eq, FCNTL_FD_CLOEXEC)?,
-                ]],
-            ),
-            allow_syscall(libc::SYS_fstat),
-            allow_syscall_if(
-                libc::SYS_futex,
-                or![
-                    and![Cond::new(1, Eq, FUTEX_WAIT_PRIVATE)?],
-                    and![Cond::new(1, Eq, FUTEX_WAKE_PRIVATE)?],
-                    and![Cond::new(1, Eq, FUTEX_REQUEUE_PRIVATE)?],
-                ],
-            ),
-            allow_syscall(libc::SYS_getrandom),
-            allow_syscall_if(libc::SYS_ioctl, create_ioctl_seccomp_rule()?),
-            allow_syscall(libc::SYS_lseek),
-            #[cfg(musl)]
-            allow_syscall_if(
-                libc::SYS_madvise,
-                or![and![Cond::new(2, Eq, libc::MADV_DONTNEED as u64)?],],
-            ),
-            allow_syscall(libc::SYS_mmap),
-            allow_syscall(libc::SYS_munmap),
-            allow_syscall(libc::SYS_open),
-            allow_syscall(libc::SYS_pipe),
-            allow_syscall(libc::SYS_read),
-            allow_syscall(libc::SYS_readv),
-            // SYS_rt_sigreturn is needed in case a fault does occur, so that the signal handler
-            // can return. Otherwise we get stuck in a fault loop.
-            allow_syscall(libc::SYS_rt_sigreturn),
-            allow_syscall(libc::SYS_stat),
-            allow_syscall_if(
-                libc::SYS_tkill,
-                or![and![Cond::new(
-                    1,
-                    Eq,
-                    sys_util::validate_signal_num(super::super::VCPU_RTSIG_OFFSET, true)
-                        .map_err(|_| Error::InvalidArgumentNumber)? as u64,
-                )?]],
-            ),
-            allow_syscall(libc::SYS_timerfd_create),
-            allow_syscall(libc::SYS_timerfd_settime),
-            allow_syscall(libc::SYS_write),
-            allow_syscall(libc::SYS_writev),
-        ]
-        .into_iter()
-        .collect(),
-        SeccompAction::Trap,
-    )?)
+pub fn default_ruleset_list() -> Result<Vec<SyscallRuleset>, Error> {
+    Ok(vec![
+        allow_syscall(libc::SYS_accept),
+        allow_syscall(libc::SYS_brk),
+        allow_syscall(libc::SYS_clock_gettime),
+        allow_syscall(libc::SYS_close),
+        allow_syscall(libc::SYS_dup),
+        allow_syscall_if(
+            libc::SYS_epoll_ctl,
+            or![
+                and![Cond::new(1, Eq, EPOLL_CTL_ADD)?],
+                and![Cond::new(1, Eq, EPOLL_CTL_DEL)?],
+            ],
+        ),
+        allow_syscall(libc::SYS_epoll_pwait),
+        allow_syscall(libc::SYS_exit),
+        allow_syscall(libc::SYS_exit_group),
+        allow_syscall_if(
+            libc::SYS_fcntl,
+            or![and![
+                Cond::new(1, Eq, FCNTL_F_SETFD)?,
+                Cond::new(2, Eq, FCNTL_FD_CLOEXEC)?,
+            ]],
+        ),
+        allow_syscall(libc::SYS_fstat),
+        allow_syscall_if(
+            libc::SYS_futex,
+            or![
+                and![Cond::new(1, Eq, FUTEX_WAIT_PRIVATE)?],
+                and![Cond::new(1, Eq, FUTEX_WAKE_PRIVATE)?],
+                and![Cond::new(1, Eq, FUTEX_REQUEUE_PRIVATE)?],
+            ],
+        ),
+        allow_syscall(libc::SYS_getrandom),
+        allow_syscall_if(libc::SYS_ioctl, create_ioctl_seccomp_rule()?),
+        allow_syscall(libc::SYS_lseek),
+        #[cfg(musl)]
+        allow_syscall_if(
+            libc::SYS_madvise,
+            or![and![Cond::new(2, Eq, libc::MADV_DONTNEED as u64)?],],
+        ),
+        allow_syscall(libc::SYS_mmap),
+        allow_syscall(libc::SYS_munmap),
+        allow_syscall(libc::SYS_open),
+        allow_syscall(libc::SYS_pipe),
+        allow_syscall(libc::SYS_read),
+        allow_syscall(libc::SYS_readv),
+        // SYS_rt_sigreturn is needed in case a fault does occur, so that the signal handler
+        // can return. Otherwise we get stuck in a fault loop.
+        allow_syscall(libc::SYS_rt_sigreturn),
+        allow_syscall(libc::SYS_stat),
+        allow_syscall_if(
+            libc::SYS_tkill,
+            or![and![Cond::new(
+                1,
+                Eq,
+                sys_util::validate_signal_num(super::super::VCPU_RTSIG_OFFSET, true)
+                    .map_err(|_| Error::InvalidArgumentNumber)? as u64,
+            )?]],
+        ),
+        allow_syscall(libc::SYS_timerfd_create),
+        allow_syscall(libc::SYS_timerfd_settime),
+        allow_syscall(libc::SYS_write),
+        allow_syscall(libc::SYS_writev),
+    ])
 }
 
 fn create_common_ioctl_seccomp_rule() -> Result<Vec<SeccompRule>, Error> {
@@ -256,40 +257,4 @@ mod tests {
     extern crate libc;
     extern crate seccomp;
 
-    use super::*;
-
-    const EXTRA_SYSCALLS: [i64; 5] = [
-        libc::SYS_clone,
-        libc::SYS_mprotect,
-        libc::SYS_rt_sigprocmask,
-        libc::SYS_set_tid_address,
-        libc::SYS_sigaltstack,
-    ];
-
-    fn add_syscalls_install_filter(mut filter: SeccompFilter) {
-        // Test error case: add empty rule array.
-        assert!(filter.add_rules(0, vec![],).is_err());
-        // Add "Allow" rule for each syscall.
-        for syscall in EXTRA_SYSCALLS.iter() {
-            assert!(filter
-                .add_rules(
-                    *syscall,
-                    vec![SeccompRule::new(vec![], SeccompAction::Allow)],
-                )
-                .is_ok());
-        }
-        assert!(filter.apply().is_ok());
-    }
-
-    #[test]
-    fn test_basic_seccomp() {
-        let filter = default_filter().unwrap().allow_all();
-        add_syscalls_install_filter(filter);
-    }
-
-    #[test]
-    fn test_advanced_seccomp() {
-        let filter = default_filter().unwrap();
-        add_syscalls_install_filter(filter);
-    }
 }

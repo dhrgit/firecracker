@@ -113,110 +113,6 @@
 //! cause the kernel to send `SIGSYS` (signal number 31) to the process.
 //! A signal handler will catch `SIGSYS` and exit with code 159 on any other syscall.
 //!
-//! ```should_panic
-//! extern crate libc;
-//! extern crate seccomp;
-//!
-//! use seccomp::*;
-//! use std::mem;
-//! use std::process::exit;
-//!
-//! const SI_OFF_SYSCALL: isize = 6;
-//! static mut SIGNAL_HANDLER_CALLED: i32 = 0;
-//!
-//! fn fail() {
-//!     exit(159);
-//! }
-//!
-//! extern "C" fn sigsys_handler(
-//!     _num: libc::c_int,
-//!     info: *mut libc::siginfo_t,
-//!     _unused: *mut libc::c_void,
-//! ) {
-//!     let syscall = unsafe { *(info as *const i32).offset(SI_OFF_SYSCALL) };
-//!     if syscall as i64 != libc::SYS_write {
-//!         fail();
-//!     }
-//!     unsafe {
-//!         SIGNAL_HANDLER_CALLED = SIGNAL_HANDLER_CALLED + 1;
-//!     }
-//! }
-//!
-//! fn gen_rules() -> Vec<SyscallRuleSet> {
-//!     vec![
-//!         allow_syscall(libc::SYS_close),
-//!         allow_syscall(libc::SYS_execve),
-//!         allow_syscall(libc::SYS_exit_group),
-//!         allow_syscall(libc::SYS_munmap),
-//!         allow_syscall(libc::SYS_open),
-//!         allow_syscall(libc::SYS_rt_sigreturn),
-//!         allow_syscall(libc::SYS_sigaltstack),
-//!     ]
-//! }
-//!
-//! fn main() {
-//!     let buf = "Hello, world!";
-//!
-//!     let mut act: libc::sigaction = unsafe { mem::zeroed() };
-//!     act.sa_flags = libc::SA_SIGINFO;
-//!     act.sa_sigaction = sigsys_handler as *const () as usize;
-//!
-//!     unsafe { libc::sigaction(libc::SIGSYS, &act, ::std::ptr::null_mut()) };
-//!
-//!     let mut filter =
-//!         SeccompFilter::new(vec![].into_iter().collect(), SeccompAction::Trap).unwrap();
-//!
-//!     gen_rules()
-//!         .into_iter()
-//!         .try_for_each(|(syscall_number, rules)| filter.add_rules(syscall_number, rules))
-//!         .unwrap();
-//!
-//!     filter
-//!         .add_rules(
-//!             libc::SYS_write,
-//!             vec![SeccompRule::new(
-//!                 vec![
-//!                     SeccompCondition::new(0, SeccompCmpOp::Eq, libc::STDOUT_FILENO as u64).unwrap(),
-//!                     SeccompCondition::new(2, SeccompCmpOp::Eq, 13).unwrap(),
-//!                 ],
-//!                 SeccompAction::Allow,
-//!             )],
-//!         )
-//!         .unwrap();
-//!
-//!     filter.apply().unwrap();
-//!
-//!     unsafe {
-//!         libc::syscall(
-//!             libc::SYS_write,
-//!             libc::STDOUT_FILENO,
-//!             buf.as_bytes(),
-//!             buf.len(),
-//!         );
-//!     };
-//!
-//!     if unsafe { SIGNAL_HANDLER_CALLED } != 0 {
-//!         fail();
-//!     }
-//!
-//!     let buf = "Goodbye!";
-//!     unsafe {
-//!         libc::syscall(
-//!             libc::SYS_write,
-//!             libc::STDOUT_FILENO,
-//!             buf.as_bytes(),
-//!             buf.len(),
-//!         );
-//!     };
-//!     if unsafe { SIGNAL_HANDLER_CALLED } != 1 {
-//!         fail();
-//!     }
-//!
-//!     unsafe {
-//!         libc::syscall(libc::SYS_getpid);
-//!     };
-//! }
-//! ```
 //! The code snippet above will print "Hello, world!" to stdout.
 //! The exit code will be 159.
 //!
@@ -229,8 +125,6 @@
 //!
 
 extern crate libc;
-
-use std::collections::BTreeMap;
 
 /// Level of filtering that causes syscall numbers and parameters to be examined.
 pub const SECCOMP_LEVEL_ADVANCED: u32 = 2;
@@ -377,30 +271,37 @@ pub struct SeccompRule {
 
 /// Type that encapsulates a tuple (syscall number, rule set).
 ///
-pub type SyscallRuleSet = (i64, Vec<SeccompRule>);
+// pub type SyscallRuleSet = (i64, Vec<SeccompRule>);
+pub struct SyscallRuleset {
+    /// syscall
+    pub syscall: i64,
+    /// rules
+    pub rules: Vec<SeccompRule>,
+}
+
 
 /// Builds the (syscall, rules) tuple for allowing a syscall regardless of arguments.
 ///
 #[inline(always)]
-pub fn allow_syscall(syscall_number: i64) -> SyscallRuleSet {
-    (
-        syscall_number,
-        vec![SeccompRule::new(vec![], SeccompAction::Allow)],
-    )
+pub fn allow_syscall(syscall: i64) -> SyscallRuleset {
+    SyscallRuleset {
+        syscall,
+        rules: vec![SeccompRule::new(vec![], SeccompAction::Allow)],
+    }
 }
 
 /// Builds the (syscall, rules) tuple for allowing a syscall with certain arguments.
 ///
 #[inline(always)]
-pub fn allow_syscall_if(syscall_number: i64, rules: Vec<SeccompRule>) -> SyscallRuleSet {
-    (syscall_number, rules)
+pub fn allow_syscall_if(syscall: i64, rules: Vec<SeccompRule>) -> SyscallRuleset {
+    SyscallRuleset { syscall, rules }
 }
 
 /// Filter containing rules assigned to syscall numbers.
 ///
 pub struct SeccompFilter {
     /// Hash map, mapping a chain of rules to a syscall number.
-    rules: BTreeMap<i64, Vec<SeccompRule>>,
+    rulesets: Vec<SyscallRuleset>,
     /// Default action to apply to syscall numbers that do not exist in the hash map.
     default_action: SeccompAction,
 }
@@ -773,42 +674,17 @@ impl SeccompFilter {
     /// * `rules` - Map of syscall numbers and the rules that will be applied to each of them.
     /// * `default_action` - Action taken for all syscalls that do not match any rule.
     ///
-    pub fn new(
-        rules: BTreeMap<i64, Vec<SeccompRule>>,
-        default_action: SeccompAction,
-    ) -> Result<Self> {
+    pub fn new(rulesets: Vec<SyscallRuleset>, default_action: SeccompAction) -> Result<Self> {
         // All inserted syscalls must have at least one rule, otherwise BPF code will break.
-        for (_, value) in rules.iter() {
-            if value.is_empty() {
+        for rs in rulesets.iter() {
+            if rs.rules.is_empty() {
                 return Err(Error::EmptyRulesVector);
             }
         }
-
         Ok(Self {
-            rules,
+            rulesets,
             default_action,
         })
-    }
-
-    /// Adds rules for the specified syscall in the filter.
-    ///
-    /// # Arguments
-    ///
-    /// * `syscall_number` - Syscall identifier.
-    /// * `rules` - Rules to be applied to the syscall.
-    ///
-    pub fn add_rules(&mut self, syscall_number: i64, mut rules: Vec<SeccompRule>) -> Result<()> {
-        // All inserted syscalls must have at least one rule, otherwise BPF code will break.
-        if rules.is_empty() {
-            return Err(Error::EmptyRulesVector);
-        }
-
-        self.rules
-            .entry(syscall_number)
-            .or_insert_with(|| vec![])
-            .append(&mut rules);
-
-        Ok(())
     }
 
     /// Builds the array of filter instructions and sends them to the kernel.
@@ -861,14 +737,14 @@ impl SeccompFilter {
         accumulator.push(EXAMINE_SYSCALL());
 
         // Orders syscalls by priority, the highest number represents the highest priority.
-        let mut iter = self.rules.into_iter();
+        let mut iter = self.rulesets.into_iter();
 
         // For each syscall adds its rule chain to the filter.
         let default_action = u32::from(self.default_action);
-        iter.try_for_each(|(syscall_number, chain)| {
+        iter.try_for_each(|rs| {
             SeccompFilter::append_syscall_chain(
-                syscall_number,
-                chain,
+                rs.syscall,
+                rs.rules,
                 default_action,
                 &mut accumulator,
                 &mut filter_len,
@@ -940,20 +816,6 @@ impl SeccompFilter {
         }
 
         Ok(())
-    }
-
-    /// Replaces the seccomp rules so as to allow every syscall contained in the rule set.
-    ///
-    pub fn allow_all(mut self) -> SeccompFilter {
-        // Pre-collect the keys to avoid the double borrow.
-        let syscalls: Vec<i64> = self.rules.keys().cloned().collect();
-        for syscall in syscalls {
-            self.rules.insert(
-                syscall,
-                vec![SeccompRule::new(vec![], SeccompAction::Allow)],
-            );
-        }
-        self
     }
 }
 
@@ -1118,98 +980,6 @@ mod tests {
 
         // Compares translated rule with hardcoded BPF instructions.
         assert_eq!(rule.into_bpf(), instructions);
-    }
-
-    #[test]
-    fn test_filter_bpf_output() {
-        // Compares translated filter with hardcoded BPF program.
-        {
-            let mut empty_rule_map = BTreeMap::new();
-            empty_rule_map.insert(1, vec![]);
-            assert!(SeccompFilter::new(empty_rule_map, SeccompAction::Allow).is_err());
-        }
-
-        let filter = SeccompFilter::new(
-            vec![
-                allow_syscall_if(
-                    1,
-                    vec![
-                        SeccompRule::new(
-                            vec![Cond::new(2, Le, 14).unwrap(), Cond::new(2, Ne, 10).unwrap()],
-                            SeccompAction::Allow,
-                        ),
-                        SeccompRule::new(
-                            vec![Cond::new(2, Gt, 20).unwrap(), Cond::new(2, Lt, 30).unwrap()],
-                            SeccompAction::Allow,
-                        ),
-                        SeccompRule::new(vec![Cond::new(2, Ge, 42).unwrap()], SeccompAction::Allow),
-                    ],
-                ),
-                allow_syscall_if(
-                    9,
-                    vec![SeccompRule::new(
-                        vec![Cond::new(1, MaskedEq(0b100), 36).unwrap()],
-                        SeccompAction::Allow,
-                    )],
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            SeccompAction::Trap,
-        )
-        .unwrap();
-        let instructions = vec![
-            BPF_STMT(0x20, 0),
-            BPF_JUMP(0x15, 1, 0, 1),
-            BPF_STMT(0x05, 1),
-            BPF_STMT(0x05, 11),
-            BPF_STMT(0x20, 36),
-            BPF_JUMP(0x15, 0, 0, 2),
-            BPF_STMT(0x20, 32),
-            BPF_JUMP(0x15, 10, 6, 0),
-            BPF_STMT(0x20, 36),
-            BPF_JUMP(0x25, 0, 4, 0),
-            BPF_JUMP(0x15, 0, 0, 2),
-            BPF_STMT(0x20, 32),
-            BPF_JUMP(0x25, 14, 1, 0),
-            BPF_STMT(0x06, 0x7fff_0000),
-            BPF_STMT(0x05, 1),
-            BPF_STMT(0x05, 12),
-            BPF_STMT(0x20, 36),
-            BPF_JUMP(0x25, 0, 9, 0),
-            BPF_JUMP(0x15, 0, 0, 2),
-            BPF_STMT(0x20, 32),
-            BPF_JUMP(0x35, 30, 6, 0),
-            BPF_STMT(0x20, 36),
-            BPF_JUMP(0x25, 0, 3, 0),
-            BPF_JUMP(0x15, 0, 0, 3),
-            BPF_STMT(0x20, 32),
-            BPF_JUMP(0x25, 20, 0, 1),
-            BPF_STMT(0x06, 0x7fff0000),
-            BPF_STMT(0x05, 1),
-            BPF_STMT(0x05, 7),
-            BPF_STMT(0x20, 36),
-            BPF_JUMP(0x25, 0, 3, 0),
-            BPF_JUMP(0x15, 0, 0, 3),
-            BPF_STMT(0x20, 32),
-            BPF_JUMP(0x35, 42, 0, 1),
-            BPF_STMT(0x06, 0x7fff0000),
-            BPF_STMT(0x06, 0x00030000),
-            BPF_JUMP(0x15, 9, 0, 1),
-            BPF_STMT(0x05, 1),
-            BPF_STMT(0x05, 8),
-            BPF_STMT(0x20, 28),
-            BPF_STMT(0x54, 0),
-            BPF_JUMP(0x15, 0, 0, 4),
-            BPF_STMT(0x20, 24),
-            BPF_STMT(0x54, 0b100),
-            BPF_JUMP(0x15, 36 & 0b100, 0, 1),
-            BPF_STMT(0x06, 0x7fff_0000),
-            BPF_STMT(0x06, 0x0003_0000),
-            BPF_STMT(0x06, 0x0003_0000),
-        ];
-
-        assert_eq!(filter.into_bpf().unwrap(), instructions);
     }
 
     #[test]
