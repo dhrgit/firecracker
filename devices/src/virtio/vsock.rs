@@ -62,6 +62,47 @@ fn init_vsock_hdr(buf: &mut [u8]) {
     }
 }
 
+enum VsockConnectionState {
+    /// Guest side is initialized, but need to set up host side
+    Connecting,
+
+    /// Both sides are initialized and ready to talk
+    Connected,
+
+    /// Closing down connections
+    Shutdown,
+}
+
+struct VsockFrame {
+    header: virtio_vsock_hdr,
+    data: Option<Vec<u8>>,
+}
+
+struct VsockAddress {
+    cid: u64,
+    port: u64
+}
+
+/// This should be a generic interface that allows using multiple types of host-side backends:
+/// sockets, objects, etc.
+/// This probably needs some way to notify that data is available to read
+trait VsockEndpoint {
+    /// Attempt to read data from the endpoint if available
+    fn read(self, VsockFrame) -> std::result::Result<Option<VsockFrame>, std::io::Error>;
+    /// Write data to the socket and return a response frame if available
+    fn write(self, VsockFrame) -> std::result::Result<Option<VsockFrame>, std::io::Error>;
+    /// EventFd on which to wait for new available packages from endpoint, if available
+    fn get_event_fd(self) -> Option<EventFd>;
+}
+
+struct VsockConnection {
+    // The current state of the state machine
+    state: VsockConnectionState,
+    guest_addr: VsockAddress,
+    host_addr: VsockAddress,
+    host_endpoint: Box<dyn VsockEndpoint>,
+}
+
 struct TxVirtio {
     queue_evt: EventFd,
     queue: Queue,
