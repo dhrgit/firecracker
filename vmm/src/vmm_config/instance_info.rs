@@ -60,7 +60,7 @@ pub enum StartMicrovmError {
     CreateRateLimiter(std::io::Error),
     #[cfg(feature = "vsock")]
     /// Creating a vsock device can only fail if the /dev/vhost-vsock device cannot be open.
-    CreateVsockDevice(devices::virtio::vhost::Error),
+    CreateVsockDevice,
     /// The device manager was not configured.
     DeviceManager,
     /// Cannot read from an Event file descriptor.
@@ -130,11 +130,8 @@ impl Display for StartMicrovmError {
             ),
             CreateRateLimiter(ref err) => write!(f, "Cannot create RateLimiter: {}", err),
             #[cfg(feature = "vsock")]
-            CreateVsockDevice(ref err) => {
-                let mut err_msg = format!("{:?}", err);
-                err_msg = err_msg.replace("\"", "");
-
-                write!(f, "Cannot create vsock device. {}", err_msg)
+            CreateVsockDevice => {
+                write!(f, "Cannot create vsock device.")
             }
             CreateNetDevice(ref err) => {
                 let mut err_msg = format!("{:?}", err);

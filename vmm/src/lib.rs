@@ -657,10 +657,9 @@ impl EpollContext {
     }
 
     #[cfg(feature = "vsock")]
-    fn allocate_virtio_vsock_tokens(&mut self) -> virtio::vhost::handle::VhostEpollConfig {
-        let (dispatch_base, sender) =
-            self.allocate_tokens(virtio::vhost::handle::VHOST_EVENTS_COUNT);
-        virtio::vhost::handle::VhostEpollConfig::new(dispatch_base, self.epoll_raw_fd, sender)
+    fn allocate_virtio_vsock_tokens(&mut self) -> virtio::vsock::EpollConfig {
+        let (dispatch_base, sender) = self.allocate_tokens(virtio::vsock::VSOCK_EVENTS_COUNT);
+        virtio::vsock::EpollConfig::new(dispatch_base, self.epoll_raw_fd, sender)
     }
 
     fn get_device_handler(&mut self, device_idx: usize) -> Result<&mut EpollHandler> {
@@ -993,11 +992,11 @@ impl Vmm {
         let device_manager = self.mmio_device_manager.as_mut().unwrap();
 
         for cfg in self.vsock_device_configs.iter() {
-            let epoll_config = self.epoll_context.allocate_virtio_vsock_tokens();
 
+            let epoll_config = self.epoll_context.allocate_virtio_vsock_tokens();
             let vsock_box = Box::new(
-                devices::virtio::Vsock::new(u64::from(cfg.guest_cid), guest_mem, epoll_config)
-                    .map_err(StartMicrovmError::CreateVsockDevice)?,
+                devices::virtio::Vsock::new(u64::from(cfg.guest_cid), epoll_config)
+                    .or(Err(StartMicrovmError::CreateVsockDevice))?,
             );
             device_manager
                 .register_virtio_device(
@@ -1008,6 +1007,7 @@ impl Vmm {
                 )
                 .map_err(StartMicrovmError::RegisterVsockDevice)?;
         }
+
         Ok(())
     }
 
