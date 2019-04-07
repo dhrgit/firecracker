@@ -88,7 +88,6 @@ use vmm_config::net::{
     NetworkInterfaceConfig, NetworkInterfaceConfigs, NetworkInterfaceError,
     NetworkInterfaceUpdateConfig,
 };
-#[cfg(feature = "vsock")]
 use vmm_config::vsock::{VsockDeviceConfig, VsockDeviceConfigs, VsockError};
 use vstate::{Vcpu, Vm};
 
@@ -221,7 +220,6 @@ pub enum VmmActionError {
     /// The action `SendCtrlAltDel` failed. Details are provided by the device-specific error
     /// `I8042DeviceError`.
     SendCtrlAltDel(ErrorKind, I8042DeviceError),
-    #[cfg(feature = "vsock")]
     /// The action `insert_vsock_device` failed either because of bad user input (`ErrorKind::User`)
     /// or an internal error (`ErrorKind::Internal`).
     VsockConfig(ErrorKind, VsockError),
@@ -342,7 +340,6 @@ impl VmmActionError {
             NetworkConfig(ref kind, _) => kind,
             StartMicrovm(ref kind, _) => kind,
             SendCtrlAltDel(ref kind, _) => kind,
-            #[cfg(feature = "vsock")]
             VsockConfig(ref kind, _) => kind,
         }
     }
@@ -360,7 +357,6 @@ impl Display for VmmActionError {
             NetworkConfig(_, ref err) => write!(f, "{}", err.to_string()),
             StartMicrovm(_, ref err) => write!(f, "{}", err.to_string()),
             SendCtrlAltDel(_, ref err) => write!(f, "{}", err.to_string()),
-            #[cfg(feature = "vsock")]
             VsockConfig(_, ref err) => write!(f, "{}", err.to_string()),
         }
     }
@@ -391,7 +387,6 @@ pub enum VmmAction {
     /// `NetworkInterfaceConfig` as input. This action can only be called before the microVM has
     /// booted. The response is sent using the `OutcomeSender`.
     InsertNetworkDevice(NetworkInterfaceConfig, OutcomeSender),
-    #[cfg(feature = "vsock")]
     /// Add a new vsock device or update one that already exists using the
     /// `VsockDeviceConfig` as input. This action can only be called before the microVM has
     /// booted. The response is sent using the `OutcomeSender`.
@@ -656,7 +651,6 @@ impl EpollContext {
         )
     }
 
-    #[cfg(feature = "vsock")]
     fn allocate_virtio_vsock_tokens(&mut self) -> virtio::vsock::EpollConfig {
         let (dispatch_base, sender) = self.allocate_tokens(virtio::vsock::VSOCK_EVENTS_COUNT);
         virtio::vsock::EpollConfig::new(dispatch_base, self.epoll_raw_fd, sender)
@@ -722,7 +716,6 @@ struct Vmm {
     // This is necessary because we want the root to always be mounted on /dev/vda.
     block_device_configs: BlockDeviceConfigs,
     network_interface_configs: NetworkInterfaceConfigs,
-    #[cfg(feature = "vsock")]
     vsock_device_configs: VsockDeviceConfigs,
 
     epoll_context: EpollContext,
@@ -777,7 +770,6 @@ impl Vmm {
             drive_handler_id_map: HashMap::new(),
             net_handler_id_map: HashMap::new(),
             network_interface_configs: NetworkInterfaceConfigs::new(),
-            #[cfg(feature = "vsock")]
             vsock_device_configs: VsockDeviceConfigs::new(),
             epoll_context,
             api_event,
@@ -978,10 +970,8 @@ impl Vmm {
         Ok(())
     }
 
-    #[cfg(feature = "vsock")]
     fn attach_vsock_devices(
         &mut self,
-        guest_mem: &GuestMemory,
     ) -> std::result::Result<(), StartMicrovmError> {
         let kernel_config = self
             .kernel_config
@@ -1108,16 +1098,7 @@ impl Vmm {
 
         self.attach_block_devices()?;
         self.attach_net_devices()?;
-        #[cfg(feature = "vsock")]
-        {
-            let guest_mem = self
-                .guest_memory
-                .clone()
-                .ok_or(StartMicrovmError::GuestMemory(
-                    memory_model::GuestMemoryError::MemoryNotInitialized,
-                ))?;
-            self.attach_vsock_devices(&guest_mem)?;
-        }
+        self.attach_vsock_devices()?;
 
         Ok(())
     }
@@ -1799,7 +1780,6 @@ impl Vmm {
         Ok(VmmData::Empty)
     }
 
-    #[cfg(feature = "vsock")]
     fn insert_vsock_device(
         &mut self,
         body: VsockDeviceConfig,
@@ -2001,7 +1981,6 @@ impl Vmm {
             VmmAction::InsertNetworkDevice(netif_body, sender) => {
                 Vmm::send_response(self.insert_net_device(netif_body), sender);
             }
-            #[cfg(feature = "vsock")]
             VmmAction::InsertVsockDevice(vsock_cfg, sender) => {
                 Vmm::send_response(self.insert_vsock_device(vsock_cfg), sender);
             }
@@ -3708,7 +3687,6 @@ mod tests {
                 .kind(),
             &ErrorKind::User
         );
-        #[cfg(feature = "vsock")]
         assert_eq!(
             format!(
                 "{:?}",

@@ -13,14 +13,12 @@ pub mod block;
 mod mmio;
 pub mod net;
 mod queue;
-#[cfg(feature = "vsock")]
 pub mod vsock;
 
 pub use self::block::*;
 pub use self::mmio::*;
 pub use self::net::*;
 pub use self::queue::*;
-#[cfg(feature = "vsock")]
 pub use self::vsock::*;
 
 use super::EpollHandlerPayload;
@@ -35,7 +33,6 @@ const DEVICE_FAILED: u32 = 0x80;
 /// Types taken from linux/virtio_ids.h.
 const TYPE_NET: u32 = 1;
 const TYPE_BLOCK: u32 = 2;
-#[cfg(feature = "vsock")]
 const TYPE_VSOCK: u32 = 19;
 
 /// Interrupt flags (re: interrupt status & acknowledge registers).

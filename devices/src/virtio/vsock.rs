@@ -73,11 +73,6 @@ enum VsockConnectionState {
     Shutdown,
 }
 
-struct VsockFrame {
-    header: virtio_vsock_hdr,
-    data: Option<Vec<u8>>,
-}
-
 struct VsockAddress {
     cid: u64,
     port: u64

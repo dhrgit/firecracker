@@ -58,7 +58,6 @@ pub enum StartMicrovmError {
     CreateNetDevice(devices::virtio::Error),
     /// Failed to create a `RateLimiter` object.
     CreateRateLimiter(std::io::Error),
-    #[cfg(feature = "vsock")]
     /// Creating a vsock device can only fail if the /dev/vhost-vsock device cannot be open.
     CreateVsockDevice,
     /// The device manager was not configured.
@@ -91,7 +90,6 @@ pub enum StartMicrovmError {
     RegisterMMIODevice(device_manager::mmio::Error),
     /// Cannot initialize a MMIO Network Device or add a device to the MMIO Bus.
     RegisterNetDevice(device_manager::mmio::Error),
-    #[cfg(feature = "vsock")]
     /// Cannot initialize a MMIO Vsock Device or add a device to the MMIO Bus.
     RegisterVsockDevice(device_manager::mmio::Error),
     /// Cannot build seccomp filters.
@@ -129,7 +127,6 @@ impl Display for StartMicrovmError {
                 err
             ),
             CreateRateLimiter(ref err) => write!(f, "Cannot create RateLimiter: {}", err),
-            #[cfg(feature = "vsock")]
             CreateVsockDevice => {
                 write!(f, "Cannot create vsock device.")
             }
@@ -206,7 +203,6 @@ impl Display for StartMicrovmError {
                     err_msg
                 )
             }
-            #[cfg(feature = "vsock")]
             RegisterVsockDevice(ref err) => {
                 let mut err_msg = format!("{}", err);
                 err_msg = err_msg.replace("\"", "");
