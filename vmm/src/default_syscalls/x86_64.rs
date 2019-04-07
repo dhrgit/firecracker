@@ -163,6 +163,9 @@ pub fn default_filter() -> Result<SeccompFilter, Error> {
             allow_syscall(libc::SYS_timerfd_settime),
             allow_syscall(libc::SYS_write),
             allow_syscall(libc::SYS_writev),
+
+            allow_syscall(libc::SYS_socket),
+            allow_syscall(libc::SYS_connect),
         ]
         .into_iter()
         .collect(),

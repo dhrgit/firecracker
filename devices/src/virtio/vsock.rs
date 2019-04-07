@@ -5,11 +5,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use super::*;
-use super::{ActivateError, ActivateResult, Queue, VirtioDevice};
+use super::{
+    ActivateError, ActivateResult, DescriptorChain, EpollHandlerPayload, Queue, VirtioDevice,
+    TYPE_VSOCK, VIRTIO_MMIO_INT_VRING,
+};
 
-use memory_model::{GuestAddress, GuestMemory};
-use std::cmp;
+use memory_model::{DataInit, GuestMemory};
 use std::result;
 use sys_util::EventFd;
 
@@ -19,12 +20,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::Error as DeviceError;
 use epoll;
-use epoll::Event;
+use std::cmp::min;
+use std::collections::{HashMap, VecDeque};
+use std::io::Write;
 use std::mem;
+use std::ops::{Deref, DerefMut};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc;
 use std::sync::Arc;
-use virtio_gen::virtio_vsock::virtio_vsock_hdr;
+use virtio_gen::virtio_vsock::{
+    virtio_vsock_hdr, virtio_vsock_op_VIRTIO_VSOCK_OP_CREDIT_UPDATE,
+    virtio_vsock_op_VIRTIO_VSOCK_OP_INVALID, virtio_vsock_op_VIRTIO_VSOCK_OP_REQUEST,
+    virtio_vsock_op_VIRTIO_VSOCK_OP_RESPONSE, virtio_vsock_op_VIRTIO_VSOCK_OP_RST,
+    virtio_vsock_op_VIRTIO_VSOCK_OP_RW, virtio_vsock_op_VIRTIO_VSOCK_OP_SHUTDOWN,
+    virtio_vsock_shutdown_VIRTIO_VSOCK_SHUTDOWN_RCV,
+    virtio_vsock_shutdown_VIRTIO_VSOCK_SHUTDOWN_SEND, virtio_vsock_type_VIRTIO_VSOCK_TYPE_STREAM,
+    VIRTIO_F_VERSION_1,
+};
 use {DeviceEventT, EpollHandler};
+use virtio::vsock::VsockError::GeneralError;
+use virtio::vsock::VsockConnectionState::LocalInitiated;
 
 // The guest has made a buffer available to receive a frame into.
 const RX_QUEUE_EVENT: DeviceEventT = 0;
@@ -39,125 +54,215 @@ const QUEUE_SIZE: u16 = 256;
 const NUM_QUEUES: usize = 3;
 const QUEUE_SIZES: &'static [u16] = &[QUEUE_SIZE; NUM_QUEUES];
 
-const fn vsock_hdr_len() -> usize {
-    mem::size_of::<virtio_vsock_hdr>()
-}
+const MAX_PKT_BUF_SIZE: usize = 65536;
 
-// Frames being sent/received through the network device model have a VNET header. This
-// function returns a slice which holds the L2 frame bytes without this header.
-fn frame_bytes_from_buf(buf: &[u8]) -> &[u8] {
-    &buf[vsock_hdr_len()..]
-}
+const TEMP_VSOCK_PATH: &str = "./vsock";
 
-fn frame_bytes_from_buf_mut(buf: &mut [u8]) -> &mut [u8] {
-    &mut buf[vsock_hdr_len()..]
-}
 
-// This initializes to all 0 the VNET hdr part of a buf.
-fn init_vsock_hdr(buf: &mut [u8]) {
-    // The buffer should be larger than vnet_hdr_len.
-    // TODO: any better way to set all these bytes to 0? Or is this optimized by the compiler?
-    for i in 0..vsock_hdr_len() {
-        buf[i] = 0;
+#[derive(Debug)]
+pub enum VsockError {
+    PacketAssemblyError,
+    GeneralError,
+}
+type Result<T> = std::result::Result<T, VsockError>;
+
+// TODO: fix this struct, since packing implines align=1
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C, packed)]
+struct VsockPacketHdr(virtio_vsock_hdr);
+
+unsafe impl DataInit for VsockPacketHdr {}
+
+impl Deref for VsockPacketHdr {
+    type Target = virtio_vsock_hdr;
+    fn deref(&self) -> &virtio_vsock_hdr {
+        &self.0
     }
+}
+
+impl DerefMut for VsockPacketHdr {
+    fn deref_mut(&mut self) -> &mut virtio_vsock_hdr {
+        &mut self.0
+    }
+}
+
+// TODO: clean this up. Perhaps discard bindged for vsock altogether
+const VSOCK_OP_INVALID: u16 = virtio_vsock_op_VIRTIO_VSOCK_OP_INVALID as u16;
+const VSOCK_OP_REQUEST: u16 = virtio_vsock_op_VIRTIO_VSOCK_OP_REQUEST as u16;
+const VSOCK_OP_RESPONSE: u16 = virtio_vsock_op_VIRTIO_VSOCK_OP_RESPONSE as u16;
+const VSOCK_OP_RST: u16 = virtio_vsock_op_VIRTIO_VSOCK_OP_RST as u16;
+const VSOCK_OP_SHUTDOWN: u16 = virtio_vsock_op_VIRTIO_VSOCK_OP_SHUTDOWN as u16;
+const VSOCK_OP_RW: u16 = virtio_vsock_op_VIRTIO_VSOCK_OP_RW as u16;
+const VSOCK_OP_CREDIT_UPDATE: u16 = virtio_vsock_op_VIRTIO_VSOCK_OP_CREDIT_UPDATE as u16;
+const VSOCK_OP_CREDIT_REQUEST: u16 = virtio_vsock_op_VIRTIO_VSOCK_OP_REQUEST as u16;
+const VSOCK_FLAGS_SHUTDOWN_RCV: u32 = virtio_vsock_shutdown_VIRTIO_VSOCK_SHUTDOWN_RCV as u32;
+const VSOCK_FLAGS_SHUTDOWN_SEND: u32 = virtio_vsock_shutdown_VIRTIO_VSOCK_SHUTDOWN_SEND as u32;
+const VSOCK_TYPE_STREAM: u16 = virtio_vsock_type_VIRTIO_VSOCK_TYPE_STREAM as u16;
+
+const VSOCK_HOST_CID: u64 = 2;
+
+#[derive(Default)]
+struct VsockPacket {
+    hdr: VsockPacketHdr,
+    buf: Vec<u8>,
+}
+
+impl VsockPacket {
+    fn new_rst(src_cid: u64, dst_cid: u64, src_port: u32, dst_port: u32) -> Self {
+        Self {
+            hdr: VsockPacketHdr(virtio_vsock_hdr {
+                src_cid,
+                dst_cid,
+                src_port,
+                dst_port,
+                type_: VSOCK_TYPE_STREAM,
+                op: VSOCK_OP_RST,
+                ..Default::default()
+            }),
+            buf: Vec::new(),
+        }
+    }
+    fn new_response(src_cid: u64, dst_cid: u64, src_port: u32, dst_port: u32) -> Self {
+        Self {
+            hdr: VsockPacketHdr(virtio_vsock_hdr {
+                src_cid,
+                dst_cid,
+                src_port,
+                dst_port,
+                type_: VSOCK_TYPE_STREAM,
+                op: VSOCK_OP_RST,
+                ..Default::default()
+            }),
+            buf: Vec::new(),
+        }
+    }
+    fn new_rw(src_cid: u64, dst_cid: u64, src_port: u32, dst_port: u32, buf: Vec<u8>) -> Self {
+        Self {
+            hdr: VsockPacketHdr(virtio_vsock_hdr {
+                src_cid,
+                dst_cid,
+                src_port,
+                dst_port,
+                type_: VSOCK_TYPE_STREAM,
+                op: VSOCK_OP_RST,
+                ..Default::default()
+            }),
+            buf,
+        }
+    }
+
 }
 
 enum VsockConnectionState {
-    /// Guest side is initialized, but need to set up host side
-    Connecting,
-
-    /// Both sides are initialized and ready to talk
-    Connected,
-
-    /// Closing down connections
-    Shutdown,
-}
-
-struct VsockAddress {
-    cid: u64,
-    port: u64
-}
-
-/// This should be a generic interface that allows using multiple types of host-side backends:
-/// sockets, objects, etc.
-/// This probably needs some way to notify that data is available to read
-trait VsockEndpoint {
-    /// Attempt to read data from the endpoint if available
-    fn read(self, VsockFrame) -> std::result::Result<Option<VsockFrame>, std::io::Error>;
-    /// Write data to the socket and return a response frame if available
-    fn write(self, VsockFrame) -> std::result::Result<Option<VsockFrame>, std::io::Error>;
-    /// EventFd on which to wait for new available packages from endpoint, if available
-    fn get_event_fd(self) -> Option<EventFd>;
+    LocalInit,
+    RemoteInit,
+    Established,
+    RemoteClose,
 }
 
 struct VsockConnection {
-    // The current state of the state machine
+    local_port: u32,
+    remote_port: u32,
+    remote: Option<UnixStream>,
     state: VsockConnectionState,
-    guest_addr: VsockAddress,
-    host_addr: VsockAddress,
-    host_endpoint: Box<dyn VsockEndpoint>,
 }
 
-struct TxVirtio {
-    queue_evt: EventFd,
-    queue: Queue,
-}
+impl VsockConnection {
 
-impl TxVirtio {
-    fn new(queue: Queue, queue_evt: EventFd) -> Self {
-        let tx_queue_max_size = queue.get_max_size() as usize;
-        TxVirtio {
-            queue_evt,
-            queue,
+    fn new_local_init(local_port: u32, remote_port: u32) -> Self {
+        match UnixStream::connect(format!("{}_{}", TEMP_VSOCK_PATH, remote_port)) {
+            Ok(remote) => Self {
+                local_port,
+                remote_port,
+                remote: Some(remote),
+                state: VsockConnectionState::Established,
+            },
+            Err(e) => {
+                info!("vsock: failed connecting to remote port {}: {:?}", remote_port, e);
+                Self {
+                    local_port,
+                    remote_port,
+                    remote: None,
+                    state: VsockConnectionState::RemoteClose,
+                }
+            }
         }
+    }
+
+
+
+    pub fn send(&mut self, pkt: VsockPacket) {
+        match pkt.hdr.op {
+            VSOCK_OP_RW => {
+                self.remote.write(pkt.buf.as_slice());
+            },
+            _ => (),
+        }
+    }
+
+    pub fn recv(&mut self, max_len: usize) -> Result<VsockPacket> {
+        Err(VsockError::GeneralError)
     }
 }
 
-struct RxVirtio {
-    queue_evt: EventFd,
-    queue: Queue,
+struct VsockMuxer {
+    rxq: VecDeque<VsockPacket>,
+    conn_map: HashMap<(u32, u32), VsockConnection>,
 }
 
-impl RxVirtio {
-    fn new(queue: Queue, queue_evt: EventFd) -> Self {
-        RxVirtio {
-            queue_evt,
-            queue,
+impl VsockMuxer {
+    pub fn new() -> Self {
+        Self {
+            rxq: VecDeque::new(),
+            conn_map: HashMap::new(),
         }
     }
-}
 
-struct EvVirtio {
-    queue_evt: EventFd,
-    queue: Queue,
-}
+    pub fn send(&mut self, pkt: VsockPacket) -> Result<()> {
+        let conn_key = (pkt.hdr.src_port, pkt.hdr.dst_port);
 
-impl EvVirtio {
-    fn new(queue: Queue, queue_evt: EventFd) -> Self {
-        EvVirtio {
-            queue_evt,
-            queue,
+        // TODO: validate pkt. e.g. type = stream, cid, etc
+        //
+
+        if !self.conn_map.contains_key(&conn_key) {
+            if pkt.hdr.op != VSOCK_OP_REQUEST {
+                warn!("vsock: dropping unexpected packet from guest, op={}", pkt.hdr.op);
+                return Err(GeneralError);
+            }
+
+            self.conn_map.insert(
+                conn_key,
+                VsockConnection::new_local_init(pkt.hdr.src_port, pkt.hdr.dst_port)
+            );
+
+            return Ok(());
         }
+
+        self.conn_map.entry(conn_key).and_modify(|conn| {
+            conn.send(pkt);
+        });
+
+        Ok(())
+
     }
-}
 
-
-struct VsockFrame {
-    header: virtio_vsock_hdr,
-    data: Vec<u8>,
+    pub fn recv(&mut self, max_len: usize) -> Option<VsockPacket> {
+        self.rxq.pop_front()
+    }
 }
 
 struct VsockEpollHandler {
-    rx: RxVirtio,
-    tx: TxVirtio,
-    ev: EvVirtio,
+    rxvq: Queue,
+    rxvq_evt: EventFd,
+    txvq: Queue,
+    txvq_evt: EventFd,
+    evq: Queue,
+    evq_evt: EventFd,
+    cid: u64,
     mem: GuestMemory,
     interrupt_status: Arc<AtomicUsize>,
     interrupt_evt: EventFd,
-    // TODO(smbarber): http://crbug.com/753630
-    // Remove once MRG_RXBUF is supported and this variable is actually used.
-    #[allow(dead_code)]
-    acked_features: u64,
+    muxer: VsockMuxer,
 }
 
 impl VsockEpollHandler {
@@ -170,31 +275,133 @@ impl VsockEpollHandler {
         })
     }
 
-    fn process_rx(&mut self) -> result::Result<(), DeviceError> {
-        for desc in self.rx.queue.iter(&self.mem) {
-            warn!("rx desc: {:?} {}", desc.addr, desc.len);
-            let mut buf = vec![0u8; desc.len as usize];
+    fn process_rx(&mut self) {
+        debug!("vsock RX q event");
+        let mut raise_irq = false;
+        while let Some(head) = self.rxvq.iter(&self.mem).next() {
+            let mut max_len = 0usize;
 
-            self.mem.read_slice_at_addr(&mut buf, desc.addr);
-            let mut hdr: [u8; vsock_hdr_len()] = [0u8; vsock_hdr_len()];
-            hdr.copy_from_slice(&buf[0..vsock_hdr_len()]);
+            let mut maybe_desc = head.next_descriptor();
+            while let Some(desc) = maybe_desc {
+                max_len += desc.len as usize;
+                maybe_desc = desc.next_descriptor();
+            }
 
-            let hdr =
-                unsafe { std::mem::transmute::<[u8; vsock_hdr_len()], virtio_vsock_hdr>(hdr) };
-
-            warn!("hdr: {:?}", hdr);
+            if let Some(pkt) = self.muxer.recv(max_len) {
+                debug!("vsock rx: writing pkt: {:#?}", pkt.hdr);
+                let len = pkt.hdr.len + (mem::size_of::<VsockPacketHdr>() as u32);
+                match self.write_pkt_to_desc_chain(pkt, &head) {
+                    Err(e) => {
+                        warn!("vsock: error writing pkt to guest mem: {:?}", e);
+                        self.rxvq.go_to_previous_position();
+                        break;
+                    }
+                    Ok(_) => raise_irq = true,
+                }
+                self.rxvq.add_used(&self.mem, head.index, len);
+            } else {
+                break;
+            }
         }
-        Ok(())
+        if raise_irq {
+            match self.signal_used_queue() {
+                Err(e) => warn!("vsock: failed to trigger IRQ: {:?}", e),
+                Ok(_) => (),
+            }
+        }
     }
 
-    fn resume_rx(&mut self) -> result::Result<(), DeviceError> {
-        self.process_rx()
+    fn process_tx(&mut self) {
+        debug!("vsock TX q event");
+        while let Some(head) = self.txvq.iter(&self.mem).next() {
+            let pkt = match self.read_pkt_from_desc_chain(&head) {
+                Ok(pkt) => {
+                    debug!("vsock: got TX packet: {:#?}", pkt.hdr);
+                    pkt
+                }
+                Err(e) => {
+                    // Reading from the TX queue shouldn't fail. If it does, though, we'll
+                    // just drop the packet. It's fine, the vsock driver does it as well.
+                    debug!("vsock: error reading TX packet: {:?}", e);
+                    continue;
+                }
+            };
+            // TODO: handle muxer send error here. What do we do with the in-flight packet?
+            self.muxer.send(pkt).unwrap();
+            self.txvq.add_used(&self.mem, head.index, 0);
+        }
+
+        self.process_rx();
     }
 
-    fn process_tx(&mut self) -> result::Result<(), DeviceError> {
-        for desc in self.tx.queue.iter(&self.mem) {
-            warn!("tx desc: {:?} {}", desc.addr, desc.len);
+    fn read_pkt_from_desc_chain(&self, head: &DescriptorChain) -> Result<VsockPacket> {
+        if (head.len as usize) < std::mem::size_of::<VsockPacketHdr>() {
+            warn!("vsock: framing error, TX desc head too small for packet header");
+            return Err(VsockError::PacketAssemblyError);
         }
+
+        // TODO: check descriptor is readable
+
+        let hdr = self
+            .mem
+            .read_obj_from_addr::<VsockPacketHdr>(head.addr)
+            .map_err(|e| VsockError::PacketAssemblyError)?;
+
+        // TODO: check hdr.len holds a sane value
+        //let mut buf = Vec::with_capacity(hdr.len as usize);
+        let mut buf = vec![0u8; hdr.len as usize];
+        buf.resize(hdr.len as usize, 0);
+
+        let mut read_cnt = 0usize;
+        let mut maybe_desc = head.next_descriptor();
+        while let Some(desc) = maybe_desc {
+            // TODO: check descriptor is readable
+            if read_cnt + (desc.len as usize) > (hdr.len as usize) {
+                warn!("vsock: malformed TX packet, vring data > hdr.len");
+                return Err(VsockError::PacketAssemblyError);
+            }
+            self.mem
+                .read_slice_at_addr(&mut buf[read_cnt..read_cnt + desc.len as usize], desc.addr)
+                .map_err(|e| VsockError::PacketAssemblyError)?;
+            read_cnt += desc.len as usize;
+            maybe_desc = desc.next_descriptor();
+        }
+
+        if read_cnt != (hdr.len as usize) {
+            warn!("vsock: malformed TX packet, vring data != hdr.len");
+            return Err(VsockError::PacketAssemblyError);
+        }
+
+        Ok(VsockPacket { hdr, buf })
+    }
+
+    fn write_pkt_to_desc_chain(&self, pkt: VsockPacket, head: &DescriptorChain) -> Result<()> {
+        if (head.len as usize) < mem::size_of::<VsockPacketHdr>() {
+            return Err(VsockError::GeneralError);
+        }
+
+        if !head.is_write_only() {
+            return Err(VsockError::GeneralError);
+        }
+
+        self.mem
+            .write_obj_at_addr::<VsockPacketHdr>(pkt.hdr, head.addr)
+            .map_err(|_| VsockError::GeneralError)?;
+
+        let mut write_cnt = 0usize;
+        let mut maybe_desc = head.next_descriptor();
+        while let Some(desc) = maybe_desc {
+            if !desc.is_write_only() {
+                return Err(VsockError::GeneralError);
+            }
+            let write_end = min(pkt.buf.len(), write_cnt + desc.len as usize);
+            write_cnt += self
+                .mem
+                .write_slice_at_addr(&pkt.buf[write_cnt..write_end], desc.addr)
+                .map_err(|_| VsockError::GeneralError)?;
+            maybe_desc = desc.next_descriptor();
+        }
+
         Ok(())
     }
 }
@@ -206,32 +413,40 @@ impl EpollHandler for VsockEpollHandler {
         _: u32,
         payload: EpollHandlerPayload,
     ) -> result::Result<(), DeviceError> {
-        warn!("Got event {}", device_event);
         match device_event {
             RX_QUEUE_EVENT => {
-                if let Err(e) = self.rx.queue_evt.read() {
+                if let Err(e) = self.rxvq_evt.read() {
                     error!("Failed to get rx queue event: {:?}", e);
                     Err(DeviceError::FailedReadingQueue {
                         event_type: "rx queue event",
                         underlying: e,
                     })
                 } else {
-                    self.process_rx()
+                    self.process_rx();
+                    Ok(())
                 }
             }
             TX_QUEUE_EVENT => {
-                if let Err(e) = self.tx.queue_evt.read() {
+                if let Err(e) = self.txvq_evt.read() {
                     error!("Failed to get tx queue event: {:?}", e);
                     Err(DeviceError::FailedReadingQueue {
                         event_type: "tx queue event",
                         underlying: e,
                     })
                 } else {
-                    self.process_tx()
+                    self.process_tx();
+                    Ok(())
                 }
             }
             EVENT_QUEUE_EVENT => {
                 warn!("Event queue unimplemented");
+                if let Err(e) = self.evq_evt.read() {
+                    error!("Failed to consume evq event: {:?}", e);
+                    return Err(DeviceError::FailedReadingQueue {
+                        event_type: "ev queue event",
+                        underlying: e,
+                    });
+                }
                 Ok(())
             }
             other => Err(DeviceError::UnknownEvent {
@@ -276,10 +491,11 @@ pub struct Vsock {
 
 impl Vsock {
     /// Create a new virtio-vsock device with the given VM cid.
-    pub fn new(cid: u64, epoll_config: EpollConfig) -> Result<Vsock> {
+    pub fn new(cid: u64, epoll_config: EpollConfig) -> super::Result<Vsock> {
         Ok(Vsock {
             cid,
-            avail_features: 0,
+            //            avail_features: 1u64 << VIRTIO_F_ANY_LAYOUT | 1u64 << VIRTIO_F_VERSION_1,
+            avail_features: 1u64 << VIRTIO_F_VERSION_1,
             acked_features: 0,
             config_space: Vec::new(),
             epoll_config,
@@ -370,7 +586,6 @@ impl VirtioDevice for Vsock {
         mut queues: Vec<Queue>,
         mut queue_evts: Vec<EventFd>,
     ) -> ActivateResult {
-        warn!("activate vsock");
         if queues.len() != NUM_QUEUES || queue_evts.len() != NUM_QUEUES {
             error!(
                 "Cannot perform activate. Expected {} queue(s), got {}",
@@ -380,27 +595,31 @@ impl VirtioDevice for Vsock {
             return Err(ActivateError::BadActivate);
         }
 
-        let rx = queues.remove(0);
-        let tx = queues.remove(0);
-        let ev = queues.remove(0);
+        let rxvq = queues.remove(0);
+        let txvq = queues.remove(0);
+        let evq = queues.remove(0);
 
-        let rx_evt = queue_evts.remove(0);
-        let tx_evt = queue_evts.remove(0);
-        let ev_evt = queue_evts.remove(0);
+        let rxvq_evt = queue_evts.remove(0);
+        let txvq_evt = queue_evts.remove(0);
+        let evq_evt = queue_evts.remove(0);
 
         let handler = VsockEpollHandler {
-            rx: RxVirtio::new(rx, rx_evt),
-            tx: TxVirtio::new(tx, tx_evt),
-            ev: EvVirtio::new(ev, ev_evt),
+            rxvq,
+            rxvq_evt,
+            txvq,
+            txvq_evt,
+            evq,
+            evq_evt,
             mem,
+            cid: self.cid,
             interrupt_status,
             interrupt_evt,
-            acked_features: 0,
+            muxer: VsockMuxer::new(),
         };
 
-        let rx_queue_rawfd = handler.rx.queue_evt.as_raw_fd();
-        let tx_queue_rawfd = handler.tx.queue_evt.as_raw_fd();
-        let ev_queue_rawfd = handler.ev.queue_evt.as_raw_fd();
+        let rx_queue_rawfd = handler.rxvq_evt.as_raw_fd();
+        let tx_queue_rawfd = handler.txvq_evt.as_raw_fd();
+        let ev_queue_rawfd = handler.evq_evt.as_raw_fd();
 
         self.epoll_config
             .sender
@@ -427,8 +646,9 @@ impl VirtioDevice for Vsock {
             self.epoll_config.epoll_raw_fd,
             epoll::ControlOptions::EPOLL_CTL_ADD,
             ev_queue_rawfd,
-            epoll::Event::new(epoll::Events::EPOLLIN, self.epoll_config.ev_queue_token)
-        ).map_err(ActivateError::EpollCtl)?;
+            epoll::Event::new(epoll::Events::EPOLLIN, self.epoll_config.ev_queue_token),
+        )
+        .map_err(ActivateError::EpollCtl)?;
 
         Ok(())
     }
