@@ -2,16 +2,32 @@
 
 pub const __BITS_PER_LONG: u32 = 64;
 pub const __FD_SETSIZE: u32 = 1024;
+pub const VIRTIO_ID_NET: u32 = 1;
+pub const VIRTIO_ID_BLOCK: u32 = 2;
+pub const VIRTIO_ID_CONSOLE: u32 = 3;
+pub const VIRTIO_ID_RNG: u32 = 4;
+pub const VIRTIO_ID_BALLOON: u32 = 5;
+pub const VIRTIO_ID_RPMSG: u32 = 7;
+pub const VIRTIO_ID_SCSI: u32 = 8;
+pub const VIRTIO_ID_9P: u32 = 9;
+pub const VIRTIO_ID_RPROC_SERIAL: u32 = 11;
+pub const VIRTIO_ID_CAIF: u32 = 12;
+pub const VIRTIO_ID_GPU: u32 = 16;
+pub const VIRTIO_ID_INPUT: u32 = 18;
+pub const VIRTIO_ID_VSOCK: u32 = 19;
+pub const VIRTIO_ID_CRYPTO: u32 = 20;
 pub const VIRTIO_CONFIG_S_ACKNOWLEDGE: u32 = 1;
 pub const VIRTIO_CONFIG_S_DRIVER: u32 = 2;
 pub const VIRTIO_CONFIG_S_DRIVER_OK: u32 = 4;
 pub const VIRTIO_CONFIG_S_FEATURES_OK: u32 = 8;
+pub const VIRTIO_CONFIG_S_NEEDS_RESET: u32 = 64;
 pub const VIRTIO_CONFIG_S_FAILED: u32 = 128;
 pub const VIRTIO_TRANSPORT_F_START: u32 = 28;
-pub const VIRTIO_TRANSPORT_F_END: u32 = 33;
+pub const VIRTIO_TRANSPORT_F_END: u32 = 34;
 pub const VIRTIO_F_NOTIFY_ON_EMPTY: u32 = 24;
 pub const VIRTIO_F_ANY_LAYOUT: u32 = 27;
 pub const VIRTIO_F_VERSION_1: u32 = 32;
+pub const VIRTIO_F_IOMMU_PLATFORM: u32 = 33;
 pub type __s8 = ::std::os::raw::c_schar;
 pub type __u8 = ::std::os::raw::c_uchar;
 pub type __s16 = ::std::os::raw::c_short;
@@ -21,7 +37,7 @@ pub type __u32 = ::std::os::raw::c_uint;
 pub type __s64 = ::std::os::raw::c_longlong;
 pub type __u64 = ::std::os::raw::c_ulonglong;
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct __kernel_fd_set {
     pub fds_bits: [::std::os::raw::c_ulong; 16usize],
 }
@@ -36,6 +52,16 @@ fn bindgen_test_layout___kernel_fd_set() {
         ::std::mem::align_of::<__kernel_fd_set>(),
         8usize,
         concat!("Alignment of ", stringify!(__kernel_fd_set))
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<__kernel_fd_set>())).fds_bits as *const _ as usize },
+        0usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(__kernel_fd_set),
+            "::",
+            stringify!(fds_bits)
+        )
     );
 }
 pub type __kernel_sighandler_t =
@@ -61,7 +87,7 @@ pub type __kernel_size_t = __kernel_ulong_t;
 pub type __kernel_ssize_t = __kernel_long_t;
 pub type __kernel_ptrdiff_t = __kernel_long_t;
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct __kernel_fsid_t {
     pub val: [::std::os::raw::c_int; 2usize],
 }
@@ -76,6 +102,16 @@ fn bindgen_test_layout___kernel_fsid_t() {
         ::std::mem::align_of::<__kernel_fsid_t>(),
         4usize,
         concat!("Alignment of ", stringify!(__kernel_fsid_t))
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<__kernel_fsid_t>())).val as *const _ as usize },
+        0usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(__kernel_fsid_t),
+            "::",
+            stringify!(val)
+        )
     );
 }
 pub type __kernel_off_t = __kernel_long_t;
@@ -96,7 +132,7 @@ pub type __be64 = __u64;
 pub type __sum16 = __u16;
 pub type __wsum = __u32;
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct virtio_vsock_config {
     pub guest_cid: __le64,
 }
@@ -112,11 +148,21 @@ fn bindgen_test_layout_virtio_vsock_config() {
         1usize,
         concat!("Alignment of ", stringify!(virtio_vsock_config))
     );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<virtio_vsock_config>())).guest_cid as *const _ as usize },
+        0usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(virtio_vsock_config),
+            "::",
+            stringify!(guest_cid)
+        )
+    );
 }
 pub const virtio_vsock_event_id_VIRTIO_VSOCK_EVENT_TRANSPORT_RESET: virtio_vsock_event_id = 0;
 pub type virtio_vsock_event_id = u32;
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct virtio_vsock_event {
     pub id: __le32,
 }
@@ -132,9 +178,19 @@ fn bindgen_test_layout_virtio_vsock_event() {
         1usize,
         concat!("Alignment of ", stringify!(virtio_vsock_event))
     );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<virtio_vsock_event>())).id as *const _ as usize },
+        0usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(virtio_vsock_event),
+            "::",
+            stringify!(id)
+        )
+    );
 }
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct virtio_vsock_hdr {
     pub src_cid: __le64,
     pub dst_cid: __le64,
@@ -158,6 +214,106 @@ fn bindgen_test_layout_virtio_vsock_hdr() {
         ::std::mem::align_of::<virtio_vsock_hdr>(),
         1usize,
         concat!("Alignment of ", stringify!(virtio_vsock_hdr))
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<virtio_vsock_hdr>())).src_cid as *const _ as usize },
+        0usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(virtio_vsock_hdr),
+            "::",
+            stringify!(src_cid)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<virtio_vsock_hdr>())).dst_cid as *const _ as usize },
+        8usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(virtio_vsock_hdr),
+            "::",
+            stringify!(dst_cid)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<virtio_vsock_hdr>())).src_port as *const _ as usize },
+        16usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(virtio_vsock_hdr),
+            "::",
+            stringify!(src_port)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<virtio_vsock_hdr>())).dst_port as *const _ as usize },
+        20usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(virtio_vsock_hdr),
+            "::",
+            stringify!(dst_port)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<virtio_vsock_hdr>())).len as *const _ as usize },
+        24usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(virtio_vsock_hdr),
+            "::",
+            stringify!(len)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<virtio_vsock_hdr>())).type_ as *const _ as usize },
+        28usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(virtio_vsock_hdr),
+            "::",
+            stringify!(type_)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<virtio_vsock_hdr>())).op as *const _ as usize },
+        30usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(virtio_vsock_hdr),
+            "::",
+            stringify!(op)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<virtio_vsock_hdr>())).flags as *const _ as usize },
+        32usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(virtio_vsock_hdr),
+            "::",
+            stringify!(flags)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<virtio_vsock_hdr>())).buf_alloc as *const _ as usize },
+        36usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(virtio_vsock_hdr),
+            "::",
+            stringify!(buf_alloc)
+        )
+    );
+    assert_eq!(
+        unsafe { &(*(::std::ptr::null::<virtio_vsock_hdr>())).fwd_cnt as *const _ as usize },
+        40usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(virtio_vsock_hdr),
+            "::",
+            stringify!(fwd_cnt)
+        )
     );
 }
 pub const virtio_vsock_type_VIRTIO_VSOCK_TYPE_STREAM: virtio_vsock_type = 1;
