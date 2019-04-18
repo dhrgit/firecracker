@@ -39,7 +39,7 @@ use virtio_gen::virtio_vsock::{
 };
 use {DeviceEventT, EpollHandler};
 use virtio::vsock::VsockError::GeneralError;
-use virtio::vsock::VsockConnectionState::LocalInitiated;
+use epoll::ControlOptions;
 
 // The guest has made a buffer available to receive a frame into.
 const RX_QUEUE_EVENT: DeviceEventT = 0;
@@ -47,8 +47,10 @@ const RX_QUEUE_EVENT: DeviceEventT = 0;
 const TX_QUEUE_EVENT: DeviceEventT = 1;
 // rx rate limiter budget is now available.
 const EVENT_QUEUE_EVENT: DeviceEventT = 2;
+const MUXER_EVENT: DeviceEventT = 3;
+
 // Number of DeviceEventT events supported by this implementation.
-pub const VSOCK_EVENTS_COUNT: usize = 3;
+pub const VSOCK_EVENTS_COUNT: usize = 4;
 
 const QUEUE_SIZE: u16 = 256;
 const NUM_QUEUES: usize = 3;
@@ -109,6 +111,7 @@ struct VsockPacket {
 
 impl VsockPacket {
     fn new_rst(src_cid: u64, dst_cid: u64, src_port: u32, dst_port: u32) -> Self {
+        // TODO: set buf_alloc
         Self {
             hdr: VsockPacketHdr(virtio_vsock_hdr {
                 src_cid,
@@ -130,7 +133,8 @@ impl VsockPacket {
                 src_port,
                 dst_port,
                 type_: VSOCK_TYPE_STREAM,
-                op: VSOCK_OP_RST,
+                op: VSOCK_OP_RESPONSE,
+                buf_alloc: 65536,
                 ..Default::default()
             }),
             buf: Vec::new(),
@@ -144,7 +148,7 @@ impl VsockPacket {
                 src_port,
                 dst_port,
                 type_: VSOCK_TYPE_STREAM,
-                op: VSOCK_OP_RST,
+                op: VSOCK_OP_RW,
                 ..Default::default()
             }),
             buf,
@@ -189,14 +193,18 @@ impl VsockConnection {
         }
     }
 
-
-
-    pub fn send(&mut self, pkt: VsockPacket) {
-        match pkt.hdr.op {
-            VSOCK_OP_RW => {
-                self.remote.write(pkt.buf.as_slice());
-            },
-            _ => (),
+    fn send(&mut self, buf: Box<[u8]>) -> Result<()> {
+        match self.remote {
+            None => Err(GeneralError),
+            Some(ref mut stream) => {
+                let wcnt = stream.write(&buf).map_err(|_| VsockError::GeneralError)?;
+                if wcnt != buf.len() {
+                    Err(GeneralError)
+                }
+                else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -205,20 +213,30 @@ impl VsockConnection {
     }
 }
 
+struct MuxerDeferredRx {
+    op: u16,
+    local_port: u32,
+    remote_port: u32,
+}
+
 struct VsockMuxer {
-    rxq: VecDeque<VsockPacket>,
+    rxq: VecDeque<MuxerDeferredRx>,
     conn_map: HashMap<(u32, u32), VsockConnection>,
+    cid: u64,
+    epoll_fd: RawFd,
 }
 
 impl VsockMuxer {
-    pub fn new() -> Self {
+    fn new(cid: u64, epoll_fd: RawFd) -> Self {
         Self {
             rxq: VecDeque::new(),
             conn_map: HashMap::new(),
+            cid,
+            epoll_fd,
         }
     }
 
-    pub fn send(&mut self, pkt: VsockPacket) -> Result<()> {
+    fn send(&mut self, pkt: VsockPacket) {
         let conn_key = (pkt.hdr.src_port, pkt.hdr.dst_port);
 
         // TODO: validate pkt. e.g. type = stream, cid, etc
@@ -226,29 +244,117 @@ impl VsockMuxer {
 
         if !self.conn_map.contains_key(&conn_key) {
             if pkt.hdr.op != VSOCK_OP_REQUEST {
+                // TODO: maybe send a RST back?
                 warn!("vsock: dropping unexpected packet from guest, op={}", pkt.hdr.op);
-                return Err(GeneralError);
+                // return Err(GeneralError);
+                return;
             }
 
-            self.conn_map.insert(
-                conn_key,
-                VsockConnection::new_local_init(pkt.hdr.src_port, pkt.hdr.dst_port)
-            );
-
-            return Ok(());
+            let conn = VsockConnection::new_local_init(pkt.hdr.src_port, pkt.hdr.dst_port);
+            match conn.state {
+                VsockConnectionState::Established => {
+                    debug!("vsock: new connection to remote:{}", pkt.hdr.dst_port);
+                    self.conn_map.insert(conn_key, conn);
+                    self.rxq.push_back(MuxerDeferredRx {
+                        op: VSOCK_OP_RESPONSE,
+                        local_port: pkt.hdr.src_port,
+                        remote_port: pkt.hdr.dst_port,
+                    });
+                },
+                VsockConnectionState::RemoteClose => {
+                    self.rxq.push_back(MuxerDeferredRx {
+                        op: VSOCK_OP_RST,
+                        local_port: pkt.hdr.src_port,
+                        remote_port: pkt.hdr.src_port,
+                    });
+                },
+                _ => {
+                    error!("vsock: unexpected remote response");
+                }
+            }
         }
 
-        self.conn_map.entry(conn_key).and_modify(|conn| {
-            conn.send(pkt);
-        });
+        match pkt.hdr.op {
+            VSOCK_OP_RW => {
+                self.conn_map.entry(conn_key).and_modify(|conn| {
+                    conn.send(pkt.buf.into_boxed_slice());
+                });
+            },
+            VSOCK_OP_SHUTDOWN => {
+                // TODO: handle clean shutdown and respect read/write indications
+                self.rxq.push_back(MuxerDeferredRx {
+                    op: VSOCK_OP_RST,
+                    local_port: pkt.hdr.src_port,
+                    remote_port: pkt.hdr.dst_port,
+                });
+                // TODO: close remote connection
+                self.conn_map.remove(&conn_key);
+            },
+            VSOCK_OP_RST => {
+                // TODO: close remote connection
+                self.conn_map.remove(&conn_key);
+            },
+            VSOCK_OP_RESPONSE => {
 
-        Ok(())
+            },
+            VSOCK_OP_CREDIT_REQUEST => {
+                // TODO: implement credit update, in reply to request
+            },
+            VSOCK_OP_CREDIT_UPDATE => {
+                // TODO: implment conn credit update
+            },
+            _ => {
+                warn!("vsock: dropping unexpected packet op: {}", pkt.hdr.op);
+                return;
+            }
+        }
+    }
+
+    fn recv(&mut self, max_len: usize) -> Option<VsockPacket> {
+        // self.rxq.pop_front()
+        if let Some(drx) = self.rxq.pop_front() {
+            let pkt = match drx.op {
+                VSOCK_OP_RST => {
+                    VsockPacket::new_rst(
+                        VSOCK_HOST_CID,
+                        self.cid,
+                        drx.remote_port,
+                        drx.local_port,
+                    )
+                },
+                VSOCK_OP_RESPONSE => {
+                    VsockPacket::new_response(
+                        VSOCK_HOST_CID,
+                        self.cid,
+                        drx.remote_port,
+                        drx.local_port,
+                    )
+                },
+                _ => return None,
+            };
+            return Some(pkt);
+        }
+        None
+    }
+
+    fn kick(&mut self) {
+        let mut epoll_events = vec![epoll::Event::new(epoll::Events::empty(), 0); 16].into_boxed_slice();
+        match epoll::wait(self.epoll_fd, 0, &mut epoll_events[..]) {
+            Ok(ev_cnt) => {
+                for i in 0..ev_cnt {
+                    self.process_event(epoll_events[i].data);
+                }
+            },
+            Err(e) => {
+                warn!("vsock: failed to consume muxer epoll event: {}", e);
+            }
+        }
+    }
+
+    fn process_event(&mut self, token: u64) {
 
     }
 
-    pub fn recv(&mut self, max_len: usize) -> Option<VsockPacket> {
-        self.rxq.pop_front()
-    }
 }
 
 struct VsockEpollHandler {
@@ -327,7 +433,7 @@ impl VsockEpollHandler {
                 }
             };
             // TODO: handle muxer send error here. What do we do with the in-flight packet?
-            self.muxer.send(pkt).unwrap();
+            self.muxer.send(pkt);
             self.txvq.add_used(&self.mem, head.index, 0);
         }
 
@@ -417,25 +523,23 @@ impl EpollHandler for VsockEpollHandler {
             RX_QUEUE_EVENT => {
                 if let Err(e) = self.rxvq_evt.read() {
                     error!("Failed to get rx queue event: {:?}", e);
-                    Err(DeviceError::FailedReadingQueue {
+                    return Err(DeviceError::FailedReadingQueue {
                         event_type: "rx queue event",
                         underlying: e,
-                    })
+                    });
                 } else {
                     self.process_rx();
-                    Ok(())
                 }
             }
             TX_QUEUE_EVENT => {
                 if let Err(e) = self.txvq_evt.read() {
                     error!("Failed to get tx queue event: {:?}", e);
-                    Err(DeviceError::FailedReadingQueue {
+                    return Err(DeviceError::FailedReadingQueue {
                         event_type: "tx queue event",
                         underlying: e,
-                    })
+                    });
                 } else {
                     self.process_tx();
-                    Ok(())
                 }
             }
             EVENT_QUEUE_EVENT => {
@@ -447,13 +551,21 @@ impl EpollHandler for VsockEpollHandler {
                         underlying: e,
                     });
                 }
-                Ok(())
             }
-            other => Err(DeviceError::UnknownEvent {
-                device: "vsock",
-                event: other,
-            }),
+            MUXER_EVENT => {
+                debug!("vsock: received muxer event");
+                self.muxer.kick();
+                self.process_rx();
+            }
+            other => {
+                return Err(DeviceError::UnknownEvent {
+                    device: "vsock",
+                    event: other,
+                });
+            },
         }
+
+        Ok(())
     }
 }
 
@@ -461,6 +573,7 @@ pub struct EpollConfig {
     rx_queue_token: u64,
     tx_queue_token: u64,
     ev_queue_token: u64,
+    muxer_token: u64,
     epoll_raw_fd: RawFd,
     sender: mpsc::Sender<Box<EpollHandler>>,
 }
@@ -475,6 +588,7 @@ impl EpollConfig {
             rx_queue_token: first_token + RX_QUEUE_EVENT as u64,
             tx_queue_token: first_token + TX_QUEUE_EVENT as u64,
             ev_queue_token: first_token + EVENT_QUEUE_EVENT as u64,
+            muxer_token: first_token + MUXER_EVENT as u64,
             epoll_raw_fd,
             sender,
         }
@@ -614,12 +728,13 @@ impl VirtioDevice for Vsock {
             cid: self.cid,
             interrupt_status,
             interrupt_evt,
-            muxer: VsockMuxer::new(),
+            muxer: VsockMuxer::new(self.cid, epoll::create(true).map_err(ActivateError::EpollCtl)?),
         };
 
         let rx_queue_rawfd = handler.rxvq_evt.as_raw_fd();
         let tx_queue_rawfd = handler.txvq_evt.as_raw_fd();
         let ev_queue_rawfd = handler.evq_evt.as_raw_fd();
+        let muxer_epoll_fd = handler.muxer.epoll_fd;
 
         self.epoll_config
             .sender
@@ -649,6 +764,15 @@ impl VirtioDevice for Vsock {
             epoll::Event::new(epoll::Events::EPOLLIN, self.epoll_config.ev_queue_token),
         )
         .map_err(ActivateError::EpollCtl)?;
+
+        epoll::ctl(
+            self.epoll_config.epoll_raw_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            muxer_epoll_fd,
+            epoll::Event::new(epoll::Events::EPOLLIN, self.epoll_config.muxer_token),
+        ).map_err(ActivateError::EpollCtl)?;
+
+
 
         Ok(())
     }
