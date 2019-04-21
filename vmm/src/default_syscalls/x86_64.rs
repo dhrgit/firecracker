@@ -164,8 +164,13 @@ pub fn default_filter() -> Result<SeccompFilter, Error> {
             allow_syscall(libc::SYS_write),
             allow_syscall(libc::SYS_writev),
 
+            // TODO: limit SYS_socket to AF_UNIX
             allow_syscall(libc::SYS_socket),
             allow_syscall(libc::SYS_connect),
+            // TODO: this is only needed for vsock nested epoll. Remove this and pass the fd via
+            // epoll config, at device creation.
+            allow_syscall(libc::SYS_epoll_create1),
+            allow_syscall(libc::SYS_recvfrom),
         ]
         .into_iter()
         .collect(),
