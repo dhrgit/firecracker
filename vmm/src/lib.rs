@@ -288,10 +288,9 @@ impl std::convert::From<StartMicrovmError> for VmmActionError {
     fn from(e: StartMicrovmError) -> Self {
         let kind = match e {
             // User errors.
-            #[cfg(feature = "vsock")]
-            StartMicrovmError::CreateVsockDevice(_) => ErrorKind::User,
             StartMicrovmError::CreateBlockDevice(_)
             | StartMicrovmError::CreateNetDevice(_)
+            | StartMicrovmError::CreateVsockDevice
             | StartMicrovmError::KernelCmdline(_)
             | StartMicrovmError::KernelLoader(_)
             | StartMicrovmError::MicroVMAlreadyRunning
@@ -300,8 +299,6 @@ impl std::convert::From<StartMicrovmError> for VmmActionError {
             | StartMicrovmError::OpenBlockDevice(_)
             | StartMicrovmError::VcpusNotConfigured => ErrorKind::User,
             // Internal errors.
-            #[cfg(feature = "vsock")]
-            StartMicrovmError::RegisterVsockDevice(_) => ErrorKind::Internal,
             StartMicrovmError::ConfigureSystem(_)
             | StartMicrovmError::ConfigureVm(_)
             | StartMicrovmError::CreateRateLimiter(_)
@@ -313,6 +310,7 @@ impl std::convert::From<StartMicrovmError> for VmmActionError {
             | StartMicrovmError::RegisterEvent
             | StartMicrovmError::RegisterMMIODevice(_)
             | StartMicrovmError::RegisterNetDevice(_)
+            | StartMicrovmError::RegisterVsockDevice(_)
             | StartMicrovmError::SeccompFilters(_)
             | StartMicrovmError::Vcpu(_)
             | StartMicrovmError::VcpuConfigure(_)
@@ -3415,11 +3413,8 @@ mod tests {
             )),
             ErrorKind::Internal
         );
-        #[cfg(feature = "vsock")]
         assert_eq!(
-            error_kind(StartMicrovmError::CreateVsockDevice(
-                devices::virtio::vhost::Error::PollError(io::Error::from_raw_os_error(0))
-            )),
+            error_kind(StartMicrovmError::CreateVsockDevice),
             ErrorKind::User
         );
         assert_eq!(
@@ -3501,7 +3496,6 @@ mod tests {
             )),
             ErrorKind::Internal
         );
-        #[cfg(feature = "vsock")]
         assert_eq!(
             error_kind(StartMicrovmError::RegisterVsockDevice(
                 device_manager::mmio::Error::IrqsExhausted

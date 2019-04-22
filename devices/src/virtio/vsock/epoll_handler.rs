@@ -55,7 +55,7 @@ impl VsockEpollHandler {
             if let Some(pkt) = self.muxer.recv(max_len) {
                 debug!("vsock rx: writing pkt: {:#?}", pkt.hdr);
                 let len = pkt.hdr.len + (mem::size_of::<VsockPacketHdr>() as u32);
-                match self.write_pkt_to_desc_chain(pkt, &head) {
+                match pkt.write_to_virtq_head(&head, &self.mem) {
                     Err(e) => {
                         warn!("vsock: error writing pkt to guest mem: {:?}", e);
                         self.rxvq.go_to_previous_position();
@@ -79,7 +79,7 @@ impl VsockEpollHandler {
     fn process_tx(&mut self) {
         debug!("vsock TX q event");
         while let Some(head) = self.txvq.iter(&self.mem).next() {
-            let pkt = match self.read_pkt_from_desc_chain(&head) {
+            let pkt = match VsockPacket::from_virtq_head(&head, &self.mem) {
                 Ok(pkt) => {
                     debug!("vsock: got TX packet: {:#?}", pkt.hdr);
                     pkt
@@ -99,76 +99,6 @@ impl VsockEpollHandler {
         self.process_rx();
     }
 
-    fn read_pkt_from_desc_chain(&self, head: &DescriptorChain) -> Result<VsockPacket> {
-        if (head.len as usize) < std::mem::size_of::<VsockPacketHdr>() {
-            warn!("vsock: framing error, TX desc head too small for packet header");
-            return Err(VsockError::PacketAssemblyError);
-        }
-
-        // TODO: check descriptor is readable
-
-        let hdr = self
-            .mem
-            .read_obj_from_addr::<VsockPacketHdr>(head.addr)
-            .map_err(|e| VsockError::PacketAssemblyError)?;
-
-        // TODO: check hdr.len holds a sane value
-        //let mut buf = Vec::with_capacity(hdr.len as usize);
-        let mut buf = vec![0u8; hdr.len as usize];
-        buf.resize(hdr.len as usize, 0);
-
-        let mut read_cnt = 0usize;
-        let mut maybe_desc = head.next_descriptor();
-        while let Some(desc) = maybe_desc {
-            // TODO: check descriptor is readable
-            if read_cnt + (desc.len as usize) > (hdr.len as usize) {
-                warn!("vsock: malformed TX packet, vring data > hdr.len");
-                return Err(VsockError::PacketAssemblyError);
-            }
-            self.mem
-                .read_slice_at_addr(&mut buf[read_cnt..read_cnt + desc.len as usize], desc.addr)
-                .map_err(|e| VsockError::PacketAssemblyError)?;
-            read_cnt += desc.len as usize;
-            maybe_desc = desc.next_descriptor();
-        }
-
-        if read_cnt != (hdr.len as usize) {
-            warn!("vsock: malformed TX packet, vring data != hdr.len");
-            return Err(VsockError::PacketAssemblyError);
-        }
-
-        Ok(VsockPacket { hdr, buf })
-    }
-
-    fn write_pkt_to_desc_chain(&self, pkt: VsockPacket, head: &DescriptorChain) -> Result<()> {
-        if (head.len as usize) < mem::size_of::<VsockPacketHdr>() {
-            return Err(VsockError::GeneralError);
-        }
-
-        if !head.is_write_only() {
-            return Err(VsockError::GeneralError);
-        }
-
-        self.mem
-            .write_obj_at_addr::<VsockPacketHdr>(pkt.hdr, head.addr)
-            .map_err(|_| VsockError::GeneralError)?;
-
-        let mut write_cnt = 0usize;
-        let mut maybe_desc = head.next_descriptor();
-        while let Some(desc) = maybe_desc {
-            if !desc.is_write_only() {
-                return Err(VsockError::GeneralError);
-            }
-            let write_end = min(pkt.buf.len(), write_cnt + desc.len as usize);
-            write_cnt += self
-                .mem
-                .write_slice_at_addr(&pkt.buf[write_cnt..write_end], desc.addr)
-                .map_err(|_| VsockError::GeneralError)?;
-            maybe_desc = desc.next_descriptor();
-        }
-
-        Ok(())
-    }
 }
 
 impl EpollHandler for VsockEpollHandler {
