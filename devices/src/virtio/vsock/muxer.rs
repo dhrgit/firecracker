@@ -10,73 +10,26 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use super::packet::VsockPacket;
+use super::connection::{VsockConnection, VsockConnectionState};
 use super::*;
+use virtio::vsock::packet::VsockPacketHdr;
 
-enum VsockConnectionState {
-    LocalInit,
-    RemoteInit,
-    Established,
-    RemoteClose,
+#[derive(Debug)]
+pub enum MuxerError {
+    BufferFull,
+    IoError(std::io::Error),
 }
 
-struct VsockConnection {
-    local_port: u32,
-    remote_port: u32,
-    remote: Option<UnixStream>,
-    state: VsockConnectionState,
-}
+pub type Result<T> = std::result::Result<T, MuxerError>;
 
-impl VsockConnection {
-
-    fn new_local_init(local_port: u32, remote_port: u32) -> Self {
-        match UnixStream::connect(format!("{}_{}", TEMP_VSOCK_PATH, remote_port)) {
-            Ok(remote) => Self {
-                local_port,
-                remote_port,
-                remote: Some(remote),
-                state: VsockConnectionState::Established,
-            },
-            Err(e) => {
-                info!("vsock: failed connecting to remote port {}: {:?}", remote_port, e);
-                Self {
-                    local_port,
-                    remote_port,
-                    remote: None,
-                    state: VsockConnectionState::RemoteClose,
-                }
-            }
-        }
-    }
-
-    fn send(&mut self, buf: Box<[u8]>) -> Result<()> {
-        match self.remote {
-            None => Err(VsockError:: GeneralError),
-            Some(ref mut stream) => {
-                let wcnt = stream.write(&buf).map_err(|_| VsockError::GeneralError)?;
-                if wcnt != buf.len() {
-                    Err(VsockError::GeneralError)
-                }
-                else {
-                    Ok(())
-                }
-            }
-        }
-    }
-
-    pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.remote.as_ref().unwrap().read(buf).map_err(|_| VsockError::GeneralError)
-        //Err(VsockError::GeneralError)
-    }
-
-}
-struct MuxerDeferredRx {
-    op: u16,
-    local_port: u32,
-    remote_port: u32,
+enum MuxerDeferredRx {
+    Packet(VsockPacket),
+    ConnData(u32, u32),
 }
 
 enum EpollListener {
     Connection {local_port: u32, remote_port: u32, ev_set: epoll::Events},
+//    IncomingConnection(UnixStream),
 }
 
 pub struct VsockMuxer {
@@ -98,130 +51,188 @@ impl VsockMuxer {
         }
     }
 
-    pub fn send(&mut self, pkt: VsockPacket) {
+    pub fn send(&mut self, pkt: VsockPacket) -> Result<()> {
         let conn_key = (pkt.hdr.src_port, pkt.hdr.dst_port);
+
+        info!("vsock: muxer.send: rxq.len = {}, hdr.op={}, hdr.len={}",
+              self.rxq.len(), pkt.hdr.op, pkt.hdr.len);
+
+        if self.rxq.len() >= 128 {
+            warn!("vsock: muxer.rxq full; refusing send()");
+            return Err(MuxerError::BufferFull);
+        }
+
+
+        // TODO: if type != stream, send RST
 
         // TODO: validate pkt. e.g. type = stream, cid, etc
         //
 
         if !self.conn_map.contains_key(&conn_key) {
             if pkt.hdr.op != VSOCK_OP_REQUEST {
-                // TODO: maybe send a RST back?
                 warn!("vsock: dropping unexpected packet from guest, op={}", pkt.hdr.op);
                 // return Err(GeneralError);
-                return;
+                return Ok(());
             }
 
-            let conn = VsockConnection::new_local_init(pkt.hdr.src_port, pkt.hdr.dst_port);
-            match conn.state {
-                VsockConnectionState::Established => {
+            match VsockConnection::new_local_init(pkt.hdr.src_port, pkt.hdr.dst_port) {
+                Ok(mut conn) => {
                     debug!("vsock: new connection to remote:{}", pkt.hdr.dst_port);
+                    conn.set_peer_credit(pkt.hdr.buf_alloc, pkt.hdr.fwd_cnt);
                     self.add_connection(conn, epoll::Events::EPOLLIN);
-                    self.rxq.push_back(MuxerDeferredRx {
-                        op: VSOCK_OP_RESPONSE,
-                        local_port: pkt.hdr.src_port,
-                        remote_port: pkt.hdr.dst_port,
-                    });
+
+                    // TODO: initialize a proper packet
+                    self.rxq.push_back(MuxerDeferredRx::Packet(VsockPacket::new_response(
+                        VSOCK_HOST_CID,
+                        self.cid,
+                        pkt.hdr.dst_port,
+                        pkt.hdr.src_port
+                    )));
                 },
-                VsockConnectionState::RemoteClose => {
-                    self.rxq.push_back(MuxerDeferredRx {
-                        op: VSOCK_OP_RST,
-                        local_port: pkt.hdr.src_port,
-                        remote_port: pkt.hdr.src_port,
-                    });
+                Err(e) => {
+                    debug!("vsock: error establishing remote connection: {:#?}", e);
+
+                    // TODO: initialize a proper packet
+                    self.rxq.push_back(MuxerDeferredRx::Packet(VsockPacket::new_rst(
+                        VSOCK_HOST_CID,
+                        self.cid,
+                        pkt.hdr.dst_port,
+                        pkt.hdr.src_port
+                    )));
                 },
-                _ => {
-                    error!("vsock: unexpected remote response");
-                }
             }
+
+            return Ok(());
         }
+
+        self.conn_map.entry(conn_key).and_modify(|conn| {
+            conn.set_peer_credit(pkt.hdr.buf_alloc, pkt.hdr.fwd_cnt);
+        });
+
+        let mut update_peer_credit = false;
 
         match pkt.hdr.op {
             VSOCK_OP_RW => {
+                let mut remove_conn = false;
                 self.conn_map.entry(conn_key).and_modify(|conn| {
-                    conn.send(pkt.buf.into_boxed_slice());
+                    match conn.send(&pkt.buf[..pkt.hdr.len as usize]) {
+                        Err(e) => {
+                            debug!("vsock: error sending data on {:?}: {:?}", conn_key, e);
+                            remove_conn = true;
+                        },
+                        Ok(complete) => {
+                            // TODO: remove write event listener, if any
+                            update_peer_credit = conn.peer_needs_credit_update();
+                        }
+                    }
                 });
+                if remove_conn {
+                    // TODO: send RST
+                    self.remove_connection(conn_key.0, conn_key.1);
+                }
             },
             VSOCK_OP_SHUTDOWN => {
                 // TODO: handle clean shutdown and respect read/write indications
-                self.rxq.push_back(MuxerDeferredRx {
-                    op: VSOCK_OP_RST,
-                    local_port: pkt.hdr.src_port,
-                    remote_port: pkt.hdr.dst_port,
-                });
-                // TODO: close remote connection
-                self.conn_map.remove(&conn_key);
+                // TODO: emulate some kind of timeout before dropping a connection with tx_buf.len > 0
+                self.rxq.push_back(MuxerDeferredRx::Packet(VsockPacket::new_rst(
+                    VSOCK_HOST_CID,
+                    self.cid,
+                    pkt.hdr.dst_port,
+                    pkt.hdr.src_port,
+                )));
+                self.remove_connection(conn_key.0, conn_key.1);
             },
             VSOCK_OP_RST => {
-                // TODO: close remote connection
-                self.conn_map.remove(&conn_key);
+                self.remove_connection(conn_key.0, conn_key.1);
             },
             VSOCK_OP_RESPONSE => {
-
+                // TODO: handle incoming connections
             },
             VSOCK_OP_CREDIT_REQUEST => {
-                // TODO: implement credit update, in reply to request
+                update_peer_credit = true;
+                debug!("vsock: got credit request; sending update");
             },
             VSOCK_OP_CREDIT_UPDATE => {
-                // TODO: implment conn credit update
+                // Nothing to do here, we've already updated peer credit
             },
             _ => {
                 warn!("vsock: dropping unexpected packet op: {}", pkt.hdr.op);
-                return;
+                return Ok(());
             }
         }
+
+        if update_peer_credit {
+            let mut fwd_cnt = 0u32;
+            self.conn_map.entry(conn_key).and_modify(|conn| {
+                fwd_cnt = conn.fwd_cnt.0;
+            });
+            self.rxq.push_back(MuxerDeferredRx::Packet(VsockPacket {
+                hdr: VsockPacketHdr {
+                    src_cid: VSOCK_HOST_CID,
+                    dst_cid: self.cid,
+                    src_port: conn_key.1,
+                    dst_port: conn_key.0,
+                    len: 0,
+                    op: VSOCK_OP_CREDIT_UPDATE,
+                    flags: 0,
+                    type_: VSOCK_TYPE_STREAM,
+                    buf_alloc: VSOCK_TX_BUF_SIZE as u32,
+                    fwd_cnt,
+                    ..Default::default()
+                },
+                buf: Vec::new(),
+            }));
+        }
+
+        Ok(())
     }
 
     pub fn recv(&mut self, max_len: usize) -> Option<VsockPacket> {
-        // self.rxq.pop_front()
+
+        info!("vsock: muxer.recv: rxq.len = {}", self.rxq.len());
+
         if let Some(drx) = self.rxq.pop_front() {
-            let pkt = match drx.op {
-                VSOCK_OP_RST => {
-                    VsockPacket::new_rst(
-                        VSOCK_HOST_CID,
-                        self.cid,
-                        drx.remote_port,
-                        drx.local_port,
-                    )
-                },
-                VSOCK_OP_RESPONSE => {
-                    VsockPacket::new_response(
-                        VSOCK_HOST_CID,
-                        self.cid,
-                        drx.remote_port,
-                        drx.local_port,
-                    )
-                },
-                VSOCK_OP_RW => {
+            let pkt = match drx {
+                MuxerDeferredRx::Packet(pkt) => pkt,
+                MuxerDeferredRx::ConnData(local_port, remote_port) => {
                     let mut buf = vec![0u8; max_len];
-                    match self.conn_map.entry((drx.local_port, drx.remote_port)) {
+                    match self.conn_map.entry((local_port, remote_port)) {
                         Entry::Occupied(mut ent) => {
-                            match ent.get_mut().recv(&mut buf[..]) {
+                            let mut conn = ent.get_mut();
+                            match conn.recv(&mut buf[..]) {
                                 Ok(len) => {
                                     buf.resize(len, 0);
-                                    VsockPacket::new_rw(
-                                        VSOCK_HOST_CID,
-                                        self.cid,
-                                        drx.remote_port,
-                                        drx.local_port,
-                                        buf
-                                    )
+                                    VsockPacket {
+                                        hdr: VsockPacketHdr {
+                                            src_cid: VSOCK_HOST_CID,
+                                            dst_cid: self.cid,
+                                            src_port: remote_port,
+                                            dst_port: local_port,
+                                            len: len as u32,
+                                            op: VSOCK_OP_RW,
+                                            flags: 0,
+                                            type_: VSOCK_TYPE_STREAM,
+                                            buf_alloc: conn.buf_alloc,
+                                            fwd_cnt: conn.fwd_cnt.0,
+                                            ..Default::default()
+                                        },
+                                        buf,
+                                    }
                                 },
                                 Err(e) => {
-                                    debug!("Error reading from connection");
+                                    debug!("vsock: error reading from connection");
+                                    // self.remove_connection(local_port, remote_port);
+                                    // TODO: send RST to driver, remove connection
                                     return None;
                                 }
                             }
-
                         },
                         Entry::Vacant(e) => {
                             debug!("Error: attempted to read from non-mapped connection");
                             return None;
                         }
                     }
-
                 }
-                _ => return None,
             };
             return Some(pkt);
         }
@@ -257,12 +268,10 @@ impl VsockMuxer {
                         local_port, remote_port, ev_set: _
                     } => {
                         // send event to connection
+                        // TODO: this will overflow self.rxq with events! Fix it
+                        //
                         if ev_set.contains(epoll::Events::EPOLLIN) {
-                            self.rxq.push_back(MuxerDeferredRx {
-                                op: VSOCK_OP_RW,
-                                local_port: *local_port,
-                                remote_port: *remote_port,
-                            });
+                            self.rxq.push_back(MuxerDeferredRx::ConnData(*local_port, *remote_port));
                         }
                         if ev_set.contains(epoll::Events::EPOLLOUT) {
                         }
@@ -275,17 +284,17 @@ impl VsockMuxer {
     }
 
     fn add_connection(&mut self, conn: VsockConnection, ev_set: epoll::Events) {
-        let remote_fd = conn.remote.as_ref().unwrap().as_raw_fd();
 
         // TODO: check epoll ctl error and return error
         epoll::ctl(
             self.epoll_fd,
             epoll::ControlOptions::EPOLL_CTL_ADD,
-            remote_fd,
-            epoll::Event::new(ev_set, remote_fd as u64)
+            conn.as_raw_fd(),
+            epoll::Event::new(ev_set, conn.as_raw_fd() as u64)
         ).unwrap();
+
         self.listener_map.insert(
-            remote_fd,
+            conn.as_raw_fd(),
             EpollListener::Connection {
                 local_port: conn.local_port,
                 remote_port: conn.remote_port,
@@ -299,7 +308,7 @@ impl VsockMuxer {
     fn remove_connection(&mut self, local_port: u32, remote_port: u32) {
         match self.conn_map.entry((local_port, remote_port)) {
             Entry::Occupied(e) => {
-                let fd = e.get().remote.as_ref().unwrap().as_raw_fd();
+                let fd = e.get().as_raw_fd();
                 if let Entry::Occupied(e2) = self.listener_map.entry(fd) {
                     e2.remove();
                 }

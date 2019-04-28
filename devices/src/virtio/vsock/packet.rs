@@ -25,7 +25,7 @@ pub struct VsockPacketHdr {
     pub flags: u32,
     pub buf_alloc: u32,
     pub fwd_cnt: u32,
-    _pad: u32,
+    pub _pad: u32,
 }
 const VSOCK_PKT_HDR_SIZE: usize = 44;
 
@@ -47,6 +47,7 @@ impl VsockPacket {
                 dst_port,
                 type_: VSOCK_TYPE_STREAM,
                 op: VSOCK_OP_RST,
+                buf_alloc: VSOCK_TX_BUF_SIZE as u32,
                 ..Default::default()
             },
             buf: Vec::new(),
@@ -62,7 +63,7 @@ impl VsockPacket {
                 dst_port,
                 type_: VSOCK_TYPE_STREAM,
                 op: VSOCK_OP_RESPONSE,
-                buf_alloc: 65536,
+                buf_alloc: VSOCK_TX_BUF_SIZE as u32,
                 ..Default::default()
             },
             buf: Vec::new(),
@@ -79,6 +80,7 @@ impl VsockPacket {
                 type_: VSOCK_TYPE_STREAM,
                 op: VSOCK_OP_RW,
                 len: buf.len() as u32,
+                buf_alloc: VSOCK_TX_BUF_SIZE as u32,
                 ..Default::default()
             },
             buf,
@@ -110,7 +112,8 @@ impl VsockPacket {
             head.addr
         ).map_err(|_| VsockError::PacketAssemblyError)?;
 
-        if hdr.len > MAX_PKT_BUF_SIZE as u32 {
+        // TODO: this check doesn't seem right
+        if hdr.len > VSOCK_TX_BUF_SIZE as u32 {
             warn!("vsock: dropping TX packet with invalid len: {}", hdr.len);
             return Err(VsockError::PacketAssemblyError);
         }
@@ -143,7 +146,7 @@ impl VsockPacket {
         Ok(VsockPacket { hdr, buf })
     }
 
-    pub fn write_to_virtq_head(&self, head: &DescriptorChain, mem: &GuestMemory) -> Result<()> {
+    pub fn write_to_virtq_head(&self, head: &DescriptorChain, mem: &GuestMemory) -> Result<usize> {
 
         if (head.len as usize) < VSOCK_PKT_HDR_SIZE {
             return Err(VsockError::GeneralError);
@@ -153,6 +156,7 @@ impl VsockPacket {
             return Err(VsockError::GeneralError);
         }
 
+        // TODO: return a more descriptive error
         mem.write_slice_at_addr(
             unsafe {
                 std::slice::from_raw_parts(
@@ -162,6 +166,10 @@ impl VsockPacket {
             },
             head.addr
         ).map_err(|e| VsockError::GeneralError)?;
+
+        if self.hdr.len == 0 {
+            return Ok(VSOCK_PKT_HDR_SIZE);
+        }
 
         let mut write_cnt = 0usize;
         let mut maybe_desc = head.next_descriptor();
@@ -176,8 +184,13 @@ impl VsockPacket {
             maybe_desc = desc.next_descriptor();
         }
 
-        Ok(())
-
+        // TODO: handle this error properly
+        if write_cnt < self.hdr.len as usize {
+            Err(VsockError::GeneralError)
+        }
+        else {
+            Ok(VSOCK_PKT_HDR_SIZE + write_cnt)
+        }
     }
 
 }

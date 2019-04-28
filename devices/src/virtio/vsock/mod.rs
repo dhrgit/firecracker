@@ -5,9 +5,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+mod connection;
 mod epoll_handler;
-mod packet;
 mod muxer;
+mod packet;
 
 
 
@@ -38,6 +39,8 @@ use super::super::Error as DeviceError;
 use super::super::{DeviceEventT, EpollHandler};
 use self::epoll_handler::VsockEpollHandler;
 use self::muxer::VsockMuxer;
+use self::connection::VsockConnection;
+use std::collections::VecDeque;
 
 
 // The guest has made a buffer available to receive a frame into.
@@ -55,7 +58,8 @@ const QUEUE_SIZE: u16 = 256;
 const NUM_QUEUES: usize = 3;
 const QUEUE_SIZES: &'static [u16] = &[QUEUE_SIZE; NUM_QUEUES];
 
-const MAX_PKT_BUF_SIZE: usize = 65536;
+//const MAX_PKT_BUF_SIZE: usize = 65536;
+const VSOCK_TX_BUF_SIZE: usize = 256*1024;
 
 const TEMP_VSOCK_PATH: &str = "./vsock";
 
@@ -73,6 +77,8 @@ const VSOCK_FLAGS_SHUTDOWN_SEND: u32 = virtio_vsock_shutdown_VIRTIO_VSOCK_SHUTDO
 const VSOCK_TYPE_STREAM: u16 = virtio_vsock_type_VIRTIO_VSOCK_TYPE_STREAM as u16;
 
 const VSOCK_HOST_CID: u64 = 2;
+
+const VIRTIO_F_IN_ORDER: usize = 35;
 
 #[derive(Debug)]
 pub enum VsockError {
@@ -121,7 +127,7 @@ impl Vsock {
     pub fn new(cid: u64, epoll_config: EpollConfig) -> super::Result<Vsock> {
         Ok(Vsock {
             cid,
-            avail_features: 1u64 << VIRTIO_F_VERSION_1,
+            avail_features: 1u64 << VIRTIO_F_VERSION_1 | 1u64 << VIRTIO_F_IN_ORDER,
             acked_features: 0,
             config_space: Vec::new(),
             epoll_config,
@@ -289,3 +295,4 @@ impl VirtioDevice for Vsock {
         Ok(())
     }
 }
+
