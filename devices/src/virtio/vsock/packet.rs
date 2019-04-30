@@ -4,12 +4,13 @@
 
 
 use std::cmp::min;
-use std::mem;
-use std::ptr;
 
 use memory_model::GuestMemory;
 
-use super::*;
+use super::super::DescriptorChain;
+use super::{Result, VsockError};
+use super::{defs, defs::uapi};
+
 
 #[cfg(target_endian = "little")]
 #[derive(Clone, Copy, Debug, Default)]
@@ -45,9 +46,9 @@ impl VsockPacket {
                 dst_cid,
                 src_port,
                 dst_port,
-                type_: VSOCK_TYPE_STREAM,
-                op: VSOCK_OP_RST,
-                buf_alloc: VSOCK_TX_BUF_SIZE as u32,
+                type_: uapi::VSOCK_TYPE_STREAM,
+                op: uapi::VSOCK_OP_RST,
+                buf_alloc: defs::MAX_PKT_BUF_SIZE as u32,
                 ..Default::default()
             },
             buf: Vec::new(),
@@ -61,31 +62,31 @@ impl VsockPacket {
                 dst_cid,
                 src_port,
                 dst_port,
-                type_: VSOCK_TYPE_STREAM,
-                op: VSOCK_OP_RESPONSE,
-                buf_alloc: VSOCK_TX_BUF_SIZE as u32,
+                type_: uapi::VSOCK_TYPE_STREAM,
+                op: uapi::VSOCK_OP_RESPONSE,
+                buf_alloc: defs::MAX_PKT_BUF_SIZE as u32,
                 ..Default::default()
             },
             buf: Vec::new(),
         }
     }
 
-    pub fn new_rw(src_cid: u64, dst_cid: u64, src_port: u32, dst_port: u32, buf: Vec<u8>) -> Self {
-        Self {
-            hdr: VsockPacketHdr {
-                src_cid,
-                dst_cid,
-                src_port,
-                dst_port,
-                type_: VSOCK_TYPE_STREAM,
-                op: VSOCK_OP_RW,
-                len: buf.len() as u32,
-                buf_alloc: VSOCK_TX_BUF_SIZE as u32,
-                ..Default::default()
-            },
-            buf,
-        }
-    }
+//    pub fn new_rw(src_cid: u64, dst_cid: u64, src_port: u32, dst_port: u32, buf: Vec<u8>) -> Self {
+//        Self {
+//            hdr: VsockPacketHdr {
+//                src_cid,
+//                dst_cid,
+//                src_port,
+//                dst_port,
+//                type_: uapi::VSOCK_TYPE_STREAM,
+//                op: uapi::VSOCK_OP_RW,
+//                len: buf.len() as u32,
+//                buf_alloc: defs::MAX_PKT_BUF_SIZE as u32,
+//                ..Default::default()
+//            },
+//            buf,
+//        }
+//    }
 
     pub fn from_virtq_head(head: &DescriptorChain, mem: &GuestMemory) -> Result<Self> {
 
@@ -112,8 +113,7 @@ impl VsockPacket {
             head.addr
         ).map_err(|_| VsockError::PacketAssemblyError)?;
 
-        // TODO: this check doesn't seem right
-        if hdr.len > VSOCK_TX_BUF_SIZE as u32 {
+        if hdr.len > defs::MAX_PKT_BUF_SIZE as u32 {
             warn!("vsock: dropping TX packet with invalid len: {}", hdr.len);
             return Err(VsockError::PacketAssemblyError);
         }
@@ -133,7 +133,7 @@ impl VsockPacket {
                 return Err(VsockError::PacketAssemblyError);
             }
             mem.read_slice_at_addr(&mut buf[read_cnt..read_cnt + desc.len as usize], desc.addr)
-                .map_err(|e| VsockError::PacketAssemblyError)?;
+                .map_err(|_| VsockError::PacketAssemblyError)?;
             read_cnt += desc.len as usize;
             maybe_desc = desc.next_descriptor();
         }
@@ -165,7 +165,7 @@ impl VsockPacket {
                 )
             },
             head.addr
-        ).map_err(|e| VsockError::GeneralError)?;
+        ).map_err(|_| VsockError::GeneralError)?;
 
         if self.hdr.len == 0 {
             return Ok(VSOCK_PKT_HDR_SIZE);

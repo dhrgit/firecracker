@@ -2,22 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::cmp::min;
-use std::mem;
+use std::result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memory_model::GuestMemory;
 use sys_util::EventFd;
 
+use super::super::super::{DeviceEventT, Error as DeviceError};
 use super::super::queue::Queue as VirtQueue;
-use super::muxer::VsockMuxer;
-use super::packet::{VsockPacket, VsockPacketHdr};
-use super::*;
-use std::collections::VecDeque;
+use super::super::{EpollHandlerPayload, VIRTIO_MMIO_INT_VRING};
+use super::{EpollHandler, VsockBackend};
+use super::unix::muxer::VsockMuxer;
+use super::packet::VsockPacket;
+use super::defs;
 
 
-pub struct VsockEpollHandler {
+pub struct VsockEpollHandler<B: VsockBackend> {
     pub rxvq: VirtQueue,
     pub rxvq_evt: EventFd,
     pub txvq: VirtQueue,
@@ -28,10 +29,10 @@ pub struct VsockEpollHandler {
     pub mem: GuestMemory,
     pub interrupt_status: Arc<AtomicUsize>,
     pub interrupt_evt: EventFd,
-    pub muxer: VsockMuxer,
+    pub backend: B,
 }
 
-impl VsockEpollHandler {
+impl<B> VsockEpollHandler<B> where B: VsockBackend {
     fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
         info!("vsock: raising IRQ");
         self.interrupt_status
@@ -57,7 +58,7 @@ impl VsockEpollHandler {
                 maybe_desc = desc.next_descriptor();
             }
 
-            if let Some(pkt) = self.muxer.recv(max_len) {
+            if let Some(pkt) = self.backend.recv_pkt(max_len) {
 //                debug!("vsock rx: writing pkt: {:#?}", pkt.hdr);
                 let len = match pkt.write_to_virtq_head(&head, &self.mem) {
                     Err(e) => {
@@ -108,7 +109,7 @@ impl VsockEpollHandler {
 
             // TODO: handle muxer send error here. What do we do with the in-flight packet?
             // TODO: figure out when to re-start TX processing. Perhaps after a muxer event?
-            if self.muxer.send(pkt).is_err() {
+            if self.backend.send_pkt(pkt) != true {
                 self.txvq.go_to_previous_position();
                 break;
             }
@@ -121,15 +122,15 @@ impl VsockEpollHandler {
 
 }
 
-impl EpollHandler for VsockEpollHandler {
+impl<B> EpollHandler for VsockEpollHandler<B> where B: VsockBackend {
     fn handle_event(
         &mut self,
         device_event: DeviceEventT,
-        _: u32,
-        payload: EpollHandlerPayload,
+        evmask: u32,
+        _payload: EpollHandlerPayload,
     ) -> result::Result<(), DeviceError> {
         match device_event {
-            RX_QUEUE_EVENT => {
+            defs::RXQ_EVENT => {
                 info!("vsock RX q event");
                 if let Err(e) = self.rxvq_evt.read() {
                     error!("Failed to get rx queue event: {:?}", e);
@@ -141,7 +142,7 @@ impl EpollHandler for VsockEpollHandler {
                     self.process_rx();
                 }
             }
-            TX_QUEUE_EVENT => {
+            defs::TXQ_EVENT => {
                 info!("vsock TX q event");
                 if let Err(e) = self.txvq_evt.read() {
                     error!("Failed to get tx queue event: {:?}", e);
@@ -153,7 +154,7 @@ impl EpollHandler for VsockEpollHandler {
                     self.process_tx();
                 }
             }
-            EVENT_QUEUE_EVENT => {
+            defs::EVQ_EVENT => {
                 warn!("Event queue unimplemented");
                 if let Err(e) = self.evq_evt.read() {
                     error!("Failed to consume evq event: {:?}", e);
@@ -163,9 +164,10 @@ impl EpollHandler for VsockEpollHandler {
                     });
                 }
             }
-            MUXER_EVENT => {
+            defs::BACKEND_EVENT => {
                 debug!("vsock: received muxer event");
-                self.muxer.kick();
+                // TODO: document this unwrap()
+                self.backend.notify(epoll::Events::from_bits(evmask).unwrap());
                 // TODO: is this right? Processing TX first, since it might have stalled before,
                 // if the muxer rxq was full. This will also trigger process_rx()
                 self.process_tx();
@@ -185,7 +187,11 @@ impl EpollHandler for VsockEpollHandler {
 #[cfg(test)]
 mod tests {
 
-    use super::*;
+    use std::collections::VecDeque;
+    use super::super::Result;
+    use super::super::defs::uapi;
+    use super::super::packet::VsockPacket;
+
 
     pub struct DummyMuxer {
         pub rxq: VecDeque<VsockPacket>,
@@ -225,23 +231,23 @@ mod tests {
             re_pkt.hdr.fwd_cnt = self.fwd_cnt as u32;
 
             match pkt.hdr.op {
-                VSOCK_OP_REQUEST => {
+                uapi::VSOCK_OP_REQUEST => {
                     self.rxq.push_back(re_pkt);
                 },
-                VSOCK_OP_RW => {
+                uapi::VSOCK_OP_RW => {
                     self.credit_update_counter += 1;
                     if self.credit_update_counter > 15 {
                         self.credit_update_counter = 0;
-                        re_pkt.hdr.op = VSOCK_OP_CREDIT_UPDATE;
+                        re_pkt.hdr.op = uapi::VSOCK_OP_CREDIT_UPDATE;
                         self.rxq.push_back(re_pkt);
                     }
                 },
-                VSOCK_OP_CREDIT_REQUEST => {
-                    re_pkt.hdr.op = VSOCK_OP_CREDIT_UPDATE;
+                uapi::VSOCK_OP_CREDIT_REQUEST => {
+                    re_pkt.hdr.op = uapi::VSOCK_OP_CREDIT_UPDATE;
                     self.rxq.push_back(re_pkt);
                 },
-                VSOCK_OP_SHUTDOWN => {
-                    re_pkt.hdr.op = VSOCK_OP_RST;
+                uapi::VSOCK_OP_SHUTDOWN => {
+                    re_pkt.hdr.op = uapi::VSOCK_OP_RST;
                     self.rxq.push_back(re_pkt);
                 },
                 _ => {

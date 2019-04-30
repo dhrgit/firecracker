@@ -3,15 +3,14 @@
 //
 
 use std::cmp::min;
-use std::collections::VecDeque;
 use std::io::{Read, Write, ErrorKind};
 use std::num::Wrapping;
 use std::os::unix::net::UnixStream;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use super::packet::VsockPacket;
-use super::*;
+//use super::super::packet::VsockPacket;
 use super::muxer::{MuxerError, Result};
+use super::{VSOCK_TX_BUF_SIZE, TEMP_VSOCK_PATH};
 
 
 pub enum VsockConnectionState {
@@ -43,7 +42,7 @@ impl VsockConnection {
     pub fn new_local_init(local_port: u32, remote_port: u32) -> Result<Self> {
 
         match UnixStream::connect(format!("{}_{}", TEMP_VSOCK_PATH, remote_port)) {
-            Ok(mut stream) => {
+            Ok(stream) => {
                 stream.set_nonblocking(true)
                     .map_err(MuxerError::IoError)?;
                 Ok(Self {
@@ -100,7 +99,7 @@ impl VsockConnection {
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
 
         let max_len = min(self.peer_avail_credit(), buf.len());
-        let mut norm_buf = unsafe {
+        let norm_buf = unsafe {
             std::slice::from_raw_parts_mut(
                 buf as *mut _ as *mut u8,
                 max_len
