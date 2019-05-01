@@ -34,6 +34,7 @@ const VSOCK_PKT_HDR_SIZE: usize = 44;
 #[derive(Default)]
 pub struct VsockPacket {
     pub hdr: VsockPacketHdr,
+    // TODO: maybe use an Option here?
     pub buf: Vec<u8>,
 }
 
@@ -177,7 +178,7 @@ impl VsockPacket {
             if !desc.is_write_only() {
                 return Err(VsockError::GeneralError);
             }
-            let write_end = min(self.buf.len(), write_cnt + desc.len as usize);
+            let write_end = min(self.hdr.len as usize, write_cnt + desc.len as usize);
             write_cnt += mem
                 .write_slice_at_addr(&self.buf[write_cnt..write_end], desc.addr)
                 .map_err(|_| VsockError::GeneralError)?;

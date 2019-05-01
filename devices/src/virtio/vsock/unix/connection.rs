@@ -2,69 +2,207 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::cmp::min;
 use std::io::{Read, Write, ErrorKind};
 use std::num::Wrapping;
 use std::os::unix::net::UnixStream;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-//use super::super::packet::VsockPacket;
-use super::muxer::{MuxerError, Result};
-use super::{VSOCK_TX_BUF_SIZE, TEMP_VSOCK_PATH};
+use super::super::packet::{VsockPacket, VsockPacketHdr};
+use super::super::defs::uapi;
+use super::{Error, Result, VSOCK_TX_BUF_SIZE, TEMP_VSOCK_PATH};
 
 
+#[derive(Debug, PartialEq)]
 pub enum VsockConnectionState {
+    LocalInit,
     Established,
-    RemoteClose,
-    LocalClose,
+    LocalClosed,
+    PeerClosed(bool, bool),
 }
 
 pub struct VsockConnection {
-    pub local_port: u32,
-    pub remote_port: u32,
-    pub stream: UnixStream,
     pub state: VsockConnectionState,
+
+    peer_cid: u64,
+    local_port: u32,
+    peer_port: u32,
+    stream: UnixStream,
 
     // TODO: implement a proper ring buffer for TX
     tx_buf: Vec<u8>,
 
-    pub buf_alloc: u32,
-    pub fwd_cnt: Wrapping<u32>,
+    buf_alloc: u32,
+    fwd_cnt: Wrapping<u32>,
     peer_buf_alloc: u32,
     peer_fwd_cnt: Wrapping<u32>,
 
     // Total bytes sent to peer (guest vsock driver)
     rx_cnt: Wrapping<u32>,
+
+    // Last fwd_cnt sent to peer
+    last_fwd_cnt_to_peer: Wrapping<u32>,
 }
 
 impl VsockConnection {
 
-    pub fn new_local_init(local_port: u32, remote_port: u32) -> Result<Self> {
+    pub fn new_peer_init(
+        peer_cid: u64,
+        local_port: u32,
+        peer_port: u32,
+        peer_buf_alloc: u32
+    ) -> Result<Self> {
 
-        match UnixStream::connect(format!("{}_{}", TEMP_VSOCK_PATH, remote_port)) {
+        match UnixStream::connect(format!("{}_{}", TEMP_VSOCK_PATH, local_port)) {
             Ok(stream) => {
                 stream.set_nonblocking(true)
-                    .map_err(MuxerError::IoError)?;
+                    .map_err(Error::IoError)?;
                 Ok(Self {
+                    peer_cid,
                     local_port,
-                    remote_port,
+                    peer_port,
                     stream,
                     state: VsockConnectionState::Established,
                     tx_buf: Vec::with_capacity(VSOCK_TX_BUF_SIZE),
                     buf_alloc: VSOCK_TX_BUF_SIZE as u32,
                     fwd_cnt: Wrapping(0),
-                    peer_buf_alloc: 0,
+                    peer_buf_alloc,
                     peer_fwd_cnt: Wrapping(0),
                     rx_cnt: Wrapping(0),
+                    last_fwd_cnt_to_peer: Wrapping(0),
                 })
             },
-            Err(e) => Err(MuxerError::IoError(e))
+            Err(e) => Err(Error::IoError(e))
         }
+    }
+
+    pub fn send_pkt(&mut self, pkt: VsockPacket) -> Result<()> {
+
+        // TODO: finish up this state machine
+
+        match self.state {
+
+            VsockConnectionState::LocalInit
+            if pkt.hdr.op == uapi::VSOCK_OP_RESPONSE => {
+                self.state = VsockConnectionState::Established;
+            },
+
+            VsockConnectionState::Established | VsockConnectionState::PeerClosed(_, false)
+            if pkt.hdr.op == uapi::VSOCK_OP_RW => {
+                self.send_bytes(pkt.buf.as_slice())?;
+            },
+
+            VsockConnectionState::Established | VsockConnectionState::LocalClosed
+            if pkt.hdr.op == uapi::VSOCK_OP_SHUTDOWN => {
+                self.state = VsockConnectionState::PeerClosed(
+                    pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0,
+                    pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0,
+                );
+                // TODO: arm kill timer and RST
+            },
+
+            VsockConnectionState::PeerClosed(rcv, snd)
+            if pkt.hdr.op == uapi::VSOCK_OP_SHUTDOWN => {
+                self.state = VsockConnectionState::PeerClosed(
+                    rcv || (pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0),
+                    snd || (pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0),
+                );
+                // TODO: arm kill timer and RST
+            },
+
+            VsockConnectionState::LocalClosed => {
+                // Only RST is valid in this state, and that would have been handled by the muxer.
+                debug!("vsock: received bad pkt op={}; terminating connection", pkt.hdr.op);
+                return Err(Error::FatalPkt);
+            },
+
+            _ if pkt.hdr.op == uapi::VSOCK_OP_CREDIT_UPDATE => {
+                // Nothing to do here; will update peer credit later on.
+            },
+
+            _ if pkt.hdr.op == uapi::VSOCK_OP_CREDIT_REQUEST => {
+
+            }
+
+            _ => {
+                // TODO: be more descriptive
+                // TODO: figure out when to drop the connection and when to stomach unexpected pkts
+                debug!(
+                    "vsock: dropping invalid TX pkt for connection: state={:?}, op={}, len={}",
+                    self.state,
+                    pkt.hdr.op,
+                    pkt.hdr.len,
+                );
+                return Ok(());
+            }
+        }
+
+        self.peer_buf_alloc = pkt.hdr.buf_alloc;
+        self.peer_fwd_cnt = Wrapping(pkt.hdr.fwd_cnt);
+
+        Ok(())
+    }
+
+    pub fn recv_pkt(&mut self, max_len: usize) -> Option<VsockPacket> {
+
+        // TODO: check state and act accordingly
+
+        debug!(
+            "vsock: conn.recv_pkt(): state={:?}, tx_buf.len={}",
+            self.state,
+            self.tx_buf.len()
+        );
+
+        if self.state == VsockConnectionState::LocalClosed
+            || (self.state == VsockConnectionState::PeerClosed(true, true) && self.tx_buf.len() == 0) {
+            return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_RST, 0, None));
+        }
+
+        if self.need_credit_update_from_peer() {
+            self.last_fwd_cnt_to_peer = self.fwd_cnt;
+            return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_CREDIT_REQUEST, 0, None));
+        }
+        if self.peer_needs_credit_update() {
+            self.last_fwd_cnt_to_peer = self.fwd_cnt;
+            return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_CREDIT_UPDATE, 0, None));
+        }
+
+        let mut buf: Vec<u8> = Vec::with_capacity(max_len);
+        buf.resize(max_len, 0);
+
+        let pkt = match self.stream.read(buf.as_mut_slice()) {
+            Ok(read_cnt) => {
+                if read_cnt == 0 {
+                    self.state = VsockConnectionState::LocalClosed;
+                    self.build_pkt_for_peer(
+                        uapi::VSOCK_OP_SHUTDOWN,
+                        uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
+                        None
+                    )
+                }
+                else {
+                    buf.resize(read_cnt, 0);
+                    self.build_pkt_for_peer(uapi::VSOCK_OP_RW, 0, Some(buf))
+                }
+            },
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    return None;
+                }
+                // TODO: maybe perform a graceful shutdown here as well?
+                // TODO: also, is returning an RST pkt here really better than Result<Option<pkt>>?
+                self.build_pkt_for_peer(uapi::VSOCK_OP_RST, 0, None)
+            }
+        };
+
+        self.rx_cnt += Wrapping(pkt.hdr.len);
+        self.last_fwd_cnt_to_peer = self.fwd_cnt;
+        Some(pkt)
     }
 
     // true -> tx buf empty
     // false -> some data still in tx buf
-    pub fn send(&mut self, buf: &[u8]) -> Result<bool> {
+    // TODO: do we need this return value?
+    fn send_bytes(&mut self, buf: &[u8]) -> Result<bool> {
 
         match self.try_flush_tx_buf() {
             Err(e) => Err(e),
@@ -87,7 +225,7 @@ impl VsockConnection {
                             Ok(false)
                         }
                         else {
-                            Err(MuxerError::IoError(e))
+                            Err(Error::IoError(e))
                         }
                     }
                 }
@@ -95,35 +233,6 @@ impl VsockConnection {
         }
     }
 
-    // TODO: figure out a useful return value here
-    pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-
-        let max_len = min(self.peer_avail_credit(), buf.len());
-        let norm_buf = unsafe {
-            std::slice::from_raw_parts_mut(
-                buf as *mut _ as *mut u8,
-                max_len
-            )
-        };
-
-        match self.stream.read(norm_buf) {
-            Err(e) => {
-                if e.kind() == ErrorKind::WouldBlock {
-                    Ok(0)
-                }
-                else {
-                    Err(MuxerError::IoError(e))
-                }
-            },
-            Ok(bytes_read) => {
-                if bytes_read == 0 {
-                    self.state = VsockConnectionState::RemoteClose;
-                }
-                self.rx_cnt += Wrapping(bytes_read as u32);
-                Ok(bytes_read)
-            },
-        }
-    }
 
     // true -> tx buf empty
     // false -> some data still in tx buf
@@ -140,7 +249,7 @@ impl VsockConnection {
                     return Ok(false);
                 }
                 else {
-                    return Err(MuxerError::IoError(e));
+                    return Err(Error::IoError(e));
                 }
             }
         };
@@ -155,19 +264,37 @@ impl VsockConnection {
         self.stream.as_raw_fd()
     }
 
-    pub fn set_peer_credit(&mut self, peer_buf_alloc: u32, peer_fwd_cnt: u32) {
-        // TODO: simplify / clean up this wrapping nonsense
-        self.peer_buf_alloc = peer_buf_alloc;
-        self.peer_fwd_cnt = Wrapping(peer_fwd_cnt);
-    }
-
     pub fn avail_credit(&self) -> usize {
         VSOCK_TX_BUF_SIZE - self.tx_buf.len()
     }
 
-    pub fn peer_needs_credit_update(&self) -> bool {
-        // TODO: detect this properly
-        (self.fwd_cnt.0 % self.buf_alloc) > (self.buf_alloc - 8192)
+    fn peer_needs_credit_update(&self) -> bool {
+        // TODO: un-hardcode and clean this up
+        (self.fwd_cnt - self.last_fwd_cnt_to_peer).0 > (self.buf_alloc - 8192)
+    }
+
+    fn need_credit_update_from_peer(&self) -> bool {
+        // TODO: un-hardcode and clean this up
+        self.peer_avail_credit() < 8192
+    }
+
+    fn build_pkt_for_peer(&self, op: u16, flags: u32, buf: Option<Vec<u8>>) -> VsockPacket {
+        VsockPacket {
+            hdr: VsockPacketHdr {
+                src_cid: uapi::VSOCK_HOST_CID,
+                dst_cid: self.peer_cid,
+                src_port: self.local_port,
+                dst_port: self.peer_port,
+                len: if let Some(ref b) = buf { b.len() as u32 } else { 0 },
+                type_: uapi::VSOCK_TYPE_STREAM,
+                op,
+                flags,
+                buf_alloc: self.buf_alloc,
+                fwd_cnt: self.fwd_cnt.0,
+                _pad: 0,
+            },
+            buf: buf.unwrap_or(Vec::new()),
+        }
     }
 
     fn peer_avail_credit(&self) -> usize {
@@ -176,7 +303,7 @@ impl VsockConnection {
 
     fn push_to_tx_buf(&mut self, buf: &[u8]) -> Result<()> {
         if self.tx_buf.len() + buf.len() > VSOCK_TX_BUF_SIZE {
-            return Err(MuxerError::BufferFull);
+            return Err(Error::BufferFull);
         }
         self.tx_buf.extend_from_slice(buf);
         Ok(())

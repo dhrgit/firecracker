@@ -14,7 +14,7 @@ pub use self::device::Vsock;
 pub use self::defs::EVENT_COUNT as VSOCK_EVENTS_COUNT;
 
 use std::sync::mpsc;
-use std::os::unix::io::{RawFd, AsRawFd};
+use std::os::unix::io::{RawFd};
 
 use super::super::EpollHandler;
 use self::packet::VsockPacket;
