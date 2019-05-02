@@ -75,6 +75,28 @@ impl VsockConnection {
         }
     }
 
+    pub fn new_local_init(
+        peer_cid: u64,
+        local_port: u32,
+        peer_port: u32,
+        stream: UnixStream
+    ) -> Self {
+        Self {
+            peer_cid,
+            local_port,
+            peer_port,
+            stream,
+            state: VsockConnectionState::LocalInit,
+            tx_buf: Vec::with_capacity(VSOCK_TX_BUF_SIZE),
+            buf_alloc: VSOCK_TX_BUF_SIZE as u32,
+            fwd_cnt: Wrapping(0),
+            peer_buf_alloc: 0,
+            peer_fwd_cnt: Wrapping(0),
+            rx_cnt: Wrapping(0),
+            last_fwd_cnt_to_peer: Wrapping(0),
+        }
+    }
+
     pub fn send_pkt(&mut self, pkt: VsockPacket) -> Result<()> {
 
         // TODO: finish up this state machine
@@ -157,6 +179,11 @@ impl VsockConnection {
             return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_RST, 0, None));
         }
 
+        if self.state == VsockConnectionState::LocalInit {
+            return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_REQUEST, 0, None));
+        }
+
+        // TODO: this will keep asking for a credit update from peer, until it receives one.
         if self.need_credit_update_from_peer() {
             self.last_fwd_cnt_to_peer = self.fwd_cnt;
             return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_CREDIT_REQUEST, 0, None));
@@ -164,6 +191,13 @@ impl VsockConnection {
         if self.peer_needs_credit_update() {
             self.last_fwd_cnt_to_peer = self.fwd_cnt;
             return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_CREDIT_UPDATE, 0, None));
+        }
+
+        // Beyond this point, we'd need to produce a data packet. No point in trying that
+        // if there's no buffer to store the data into.
+        //
+        if max_len == 0 {
+            return None;
         }
 
         let mut buf: Vec<u8> = Vec::with_capacity(max_len);

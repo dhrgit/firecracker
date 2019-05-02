@@ -12,6 +12,7 @@ const TEMP_VSOCK_PATH: &str = "./vsock";
 #[derive(Debug)]
 pub enum Error {
     BufferFull,
+    EpollCtl(std::io::Error),
     FatalPkt,
     IoError(std::io::Error),
 }

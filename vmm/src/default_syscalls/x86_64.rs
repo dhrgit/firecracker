@@ -164,6 +164,8 @@ pub fn default_filter() -> Result<SeccompFilter, Error> {
             allow_syscall(libc::SYS_write),
             allow_syscall(libc::SYS_writev),
 
+            // TODO: vsock needs EPOLL_CTL_MOD, which is not covered above. Sort this out.
+            allow_syscall(libc::SYS_epoll_ctl),
             // TODO: limit SYS_socket to AF_UNIX
             allow_syscall(libc::SYS_socket),
             allow_syscall(libc::SYS_connect),
@@ -171,6 +173,9 @@ pub fn default_filter() -> Result<SeccompFilter, Error> {
             // epoll config, at device creation.
             allow_syscall(libc::SYS_epoll_create1),
             allow_syscall(libc::SYS_recvfrom),
+            // TODO: only here for vsock; remove this and pass the listening FD from the VMM
+            allow_syscall(libc::SYS_bind),
+            allow_syscall(libc::SYS_listen),
         ]
         .into_iter()
         .collect(),

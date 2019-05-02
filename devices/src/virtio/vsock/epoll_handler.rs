@@ -13,7 +13,6 @@ use super::super::super::{DeviceEventT, Error as DeviceError};
 use super::super::queue::Queue as VirtQueue;
 use super::super::{EpollHandlerPayload, VIRTIO_MMIO_INT_VRING};
 use super::{EpollHandler, VsockBackend};
-use super::unix::muxer::VsockMuxer;
 use super::packet::VsockPacket;
 use super::defs;
 
@@ -34,7 +33,7 @@ pub struct VsockEpollHandler<B: VsockBackend> {
 
 impl<B> VsockEpollHandler<B> where B: VsockBackend {
     fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
-        info!("vsock: raising IRQ");
+        debug!("vsock: raising IRQ");
         self.interrupt_status
             .fetch_or(VIRTIO_MMIO_INT_VRING as usize, Ordering::SeqCst);
         self.interrupt_evt.write(1).map_err(|e| {
@@ -45,10 +44,10 @@ impl<B> VsockEpollHandler<B> where B: VsockBackend {
 
     fn process_rx(&mut self) {
 
-        info!("vsock: epoll_handler::process_rx()");
-//        info!("vsock: enter process_rx(): next_avail={}, next_used={}", self.rxvq.next_avail.0, self.rxvq.next_used.0);
+        debug!("vsock: epoll_handler::process_rx()");
 
         let mut raise_irq = false;
+
         while let Some(head) = self.rxvq.iter(&self.mem).next() {
             let mut max_len = 0usize;
 
@@ -59,65 +58,56 @@ impl<B> VsockEpollHandler<B> where B: VsockBackend {
             }
 
             if let Some(pkt) = self.backend.recv_pkt(max_len) {
-//                debug!("vsock rx: writing pkt: {:#?}", pkt.hdr);
                 let len = match pkt.write_to_virtq_head(&head, &self.mem) {
                     Err(e) => {
                         warn!("vsock: error writing pkt to guest mem: {:?}", e);
                         self.rxvq.go_to_previous_position();
                         break;
                     }
-                    Ok(len) => {
-                        raise_irq = true;
-                        len
-                    },
+                    Ok(len) => len,
                 };
+                raise_irq = true;
                 self.rxvq.add_used(&self.mem, head.index, len as u32);
             } else {
-                info!("vsock: muxer.recv() -> None");
                 self.rxvq.go_to_previous_position();
                 break;
             }
         }
-        // TODO: properly raise IRQ (after any new used TX / RX buffer)
-        if raise_irq || true {
-            match self.signal_used_queue() {
-                Err(e) => warn!("vsock: failed to trigger IRQ: {:?}", e),
-                Ok(_) => (),
-            }
+
+        if raise_irq {
+            self.signal_used_queue().unwrap_or_default();
         }
-//        info!("vsock: exit process_rx(): next_avail={}, next_used={}", self.rxvq.next_avail.0, self.rxvq.next_used.0);
     }
 
     fn process_tx(&mut self) {
 
-        info!("vsock: epoll_handler::process_tx()");
+        debug!("vsock: epoll_handler::process_tx()");
+
+        let mut raise_irq = false;
 
         while let Some(head) = self.txvq.iter(&self.mem).next() {
             let pkt = match VsockPacket::from_virtq_head(&head, &self.mem) {
-                Ok(pkt) => {
-//                    debug!("vsock: got TX packet: {:#?}", pkt.hdr);
-                    pkt
-                }
+                Ok(pkt) => pkt,
                 Err(e) => {
-                    // Reading from the TX queue shouldn't fail. If it does, though, we'll
-                    // just drop the packet. It's fine, the vsock driver does it as well.
                     error!("vsock: error reading TX packet: {:?}", e);
+                    raise_irq = true;
                     self.txvq.add_used(&self.mem, head.index, 0);
                     continue;
                 }
             };
 
-            // TODO: handle muxer send error here. What do we do with the in-flight packet?
-            // TODO: figure out when to re-start TX processing. Perhaps after a muxer event?
             if self.backend.send_pkt(pkt) != true {
                 self.txvq.go_to_previous_position();
                 break;
             }
 
+            raise_irq = true;
             self.txvq.add_used(&self.mem, head.index, 0);
         }
 
-        self.process_rx();
+        if raise_irq {
+            self.signal_used_queue().unwrap_or_default();
+        }
     }
 
 }
@@ -152,6 +142,7 @@ impl<B> EpollHandler for VsockEpollHandler<B> where B: VsockBackend {
                     });
                 } else {
                     self.process_tx();
+                    self.process_rx();
                 }
             }
             defs::EVQ_EVENT => {
@@ -165,12 +156,17 @@ impl<B> EpollHandler for VsockEpollHandler<B> where B: VsockBackend {
                 }
             }
             defs::BACKEND_EVENT => {
-                debug!("vsock: received muxer event");
-                // TODO: document this unwrap()
-                self.backend.notify(epoll::Events::from_bits(evmask).unwrap());
-                // TODO: is this right? Processing TX first, since it might have stalled before,
-                // if the muxer rxq was full. This will also trigger process_rx()
-                self.process_tx();
+                debug!("vsock: received backend event");
+                if let Some(evset) = epoll::Events::from_bits(evmask) {
+                    self.backend.notify(evset);
+                }
+                else {
+                    error!("vsock: invalid backend event, evmask={}", evmask);
+                }
+
+                // This event may have caused some packets to be queued up by the backend.
+                // Make sure they are processed.
+                self.process_rx();
             }
             other => {
                 return Err(DeviceError::UnknownEvent {
