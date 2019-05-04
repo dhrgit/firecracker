@@ -5,19 +5,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use super::super::EpollHandlerPayload;
-use super::INTERRUPT_STATUS_USED_RING;
-
-use sys_util::EventFd;
-use vhost_backend::Vhost;
-use DeviceEventT;
-use EpollHandler;
-
-use super::super::super::Error as DeviceError;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+
+use sys_util::EventFd;
+use vhost_backend::Vhost;
+
+use super::super::EpollHandlerPayload;
+use super::INTERRUPT_STATUS_USED_RING;
+use crate::{DeviceEventT, EpollHandler, Error as DeviceError};
 
 /// Event for injecting IRQ into guest.
 pub const VHOST_IRQ_AVAILABLE: DeviceEventT = 0;
