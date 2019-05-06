@@ -49,18 +49,18 @@ mod defs {
 
         pub const VIRTIO_ID_VSOCK: u32 = gen::VIRTIO_ID_VSOCK;
 
-        pub const VSOCK_OP_CREDIT_REQUEST: u16 = gen::virtio_vsock_op_VIRTIO_VSOCK_OP_CREDIT_REQUEST as u16;
-        pub const VSOCK_OP_CREDIT_UPDATE: u16 = gen::virtio_vsock_op_VIRTIO_VSOCK_OP_CREDIT_UPDATE as u16;
-        pub const VSOCK_OP_REQUEST: u16 = gen::virtio_vsock_op_VIRTIO_VSOCK_OP_REQUEST as u16;
-        pub const VSOCK_OP_RESPONSE: u16 = gen::virtio_vsock_op_VIRTIO_VSOCK_OP_RESPONSE as u16;
-        pub const VSOCK_OP_RST: u16 = gen::virtio_vsock_op_VIRTIO_VSOCK_OP_RST as u16;
-        pub const VSOCK_OP_RW: u16 = gen::virtio_vsock_op_VIRTIO_VSOCK_OP_RW as u16;
-        pub const VSOCK_OP_SHUTDOWN: u16 = gen::virtio_vsock_op_VIRTIO_VSOCK_OP_SHUTDOWN as u16;
+        pub const VSOCK_OP_REQUEST: u16 = 1;
+        pub const VSOCK_OP_RESPONSE: u16 = 2;
+        pub const VSOCK_OP_RST: u16 = 3;
+        pub const VSOCK_OP_SHUTDOWN: u16 = 4;
+        pub const VSOCK_OP_RW: u16 = 5;
+        pub const VSOCK_OP_CREDIT_UPDATE: u16 = 6;
+        pub const VSOCK_OP_CREDIT_REQUEST: u16 = 7;
 
-        pub const VSOCK_FLAGS_SHUTDOWN_RCV: u32 = gen::virtio_vsock_shutdown_VIRTIO_VSOCK_SHUTDOWN_RCV as u32;
-        pub const VSOCK_FLAGS_SHUTDOWN_SEND: u32 = gen::virtio_vsock_shutdown_VIRTIO_VSOCK_SHUTDOWN_SEND as u32;
+        pub const VSOCK_FLAGS_SHUTDOWN_RCV: u32 = 1;
+        pub const VSOCK_FLAGS_SHUTDOWN_SEND: u32 = 2;
 
-        pub const VSOCK_TYPE_STREAM: u16 = gen::virtio_vsock_type_VIRTIO_VSOCK_TYPE_STREAM as u16;
+        pub const VSOCK_TYPE_STREAM: u16 = 1;
 
         pub const VSOCK_HOST_CID: u64 = 2;
     }

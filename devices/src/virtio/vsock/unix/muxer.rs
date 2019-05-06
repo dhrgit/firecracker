@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::collections::hash_map::{Entry};
-use std::io::{Read, ErrorKind};
+use std::io::{Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::io::{RawFd, AsRawFd};
 
@@ -78,161 +78,161 @@ impl VsockMuxer {
 
 
     fn process_event(&mut self, fd: RawFd, evset: epoll::Events) {
-        debug!("vsock muxer: processing event ({:#?}, {:#?})", fd, evset);
 
-        enum Action {
-            AddFutureConn(UnixStream),
-            HandleConnEvent(ConnMapKey),
-            UpgradeFutureConn(u32),
-            RemoveFutureConn,
-            Nop
+        match self.listener_map.get_mut(&fd) {
+
+            Some(EpollListener::Connection {key, evset: conn_evset}) => {
+                let conn_key_copy = *key;
+                let conn_evset_copy = *conn_evset;
+                match self.process_conn_event(conn_key_copy, conn_evset_copy, fd, evset) {
+                    Ok(()) => (),
+                    Err(err) => {
+                        error!(
+                            "vsock muxer: error processing connection event: {:?}",
+                            err
+                        );
+                        self.remove_connection(conn_key_copy);
+                        // TODO: try send rst
+                    }
+                }
+            },
+
+            Some(EpollListener::RxSock) => {
+                match self.rx_sock.accept() {
+                    Ok((stream, name)) => {
+                        match stream.set_nonblocking(true) {
+                            Err(err) => {
+                                error!(
+                                    "vsock muxer: unable to set local connection non-blocking: {:?}",
+                                    err
+                                );
+                            },
+                            Ok(()) => ()
+                        }
+                        debug!("vsock muxer: new local connection: {:?}", name);
+                        self.add_listener(
+                            stream.as_raw_fd(),
+                            EpollListener::FutureConn(stream)
+                        ).unwrap_or_else(|err| {
+                            error!(
+                                "vsock muxer: unable to add listener for local connection: {:?}",
+                                err
+                            );
+                        });
+                    },
+                    Err(err) => {
+                        error!("vsock muxer: error accepting local connection: {:?}", err);
+                    }
+                }
+            },
+
+            Some(EpollListener::FutureConn(_)) => {
+                if let Some(EpollListener::FutureConn(mut stream)) = self.remove_listener(fd) {
+                    match Self::read_local_stream_port(&mut stream) {
+                        Err(err) => {
+                            error!("vsock muxer: error reading port from local stream: {:?}", err);
+                        },
+                        Ok(peer_port) => {
+                            if let Some(local_port) = self.allocate_local_port() {
+                                let conn_key = ConnMapKey {local_port, peer_port};
+                                self.add_connection(
+                                    conn_key,
+                                    VsockConnection::new_local_init(
+                                        self.cid,
+                                        local_port,
+                                        peer_port,
+                                        stream
+                                    )
+                                ).and_then(|_| {
+                                    self.rxq.push_back(MuxerRx::ConnRx(conn_key));
+                                    Ok(())
+                                }).unwrap_or_else(|err| {
+                                    error!("vsock muxer: error adding connection: {:?}", err);
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            _ => {
+                warn!("vsock muxer: unexpected event: fd={:?}, evset={:?}", fd, evset);
+            },
         }
-        let mut action = Action::Nop;
+    }
 
-        {
-            match self.listener_map.get_mut(&fd)  {
-                Some(EpollListener::Connection {key, ..}) => {
-                    action = Action::HandleConnEvent(*key);
+    fn process_conn_event(
+        &mut self,
+        key: ConnMapKey,
+        conn_evset: epoll::Events,
+        fd: RawFd,
+        evset: epoll::Events
+    ) -> Result<()> {
+
+        let mut new_evset = conn_evset;
+
+        if evset.contains(epoll::Events::EPOLLOUT) {
+            let mut flush_res = Ok(true);
+            self.conn_map.entry(key).and_modify(|conn| {
+                flush_res = conn.flush_tx_buf();
+            });
+            match flush_res {
+                Err(err) => return Err(err),
+                Ok(true) => {
+                    new_evset.remove(epoll::Events::EPOLLOUT);
                 },
-                Some(EpollListener::RxSock) => {
-                    if let Ok((stream, _))  = self.rx_sock.accept() {
-                        debug!("vsock: accepting local connection");
-                        if stream.set_nonblocking(true).is_ok() {
-                            action = Action::AddFutureConn(stream);
-                        }
-                    }
-                    else {
-                        debug!("vsock: error accept()ing local connection");
-                    }
-                },
-                Some(EpollListener::FutureConn(ref mut stream)) => {
-                    let mut buf = vec![0u8; 64];
-                    match stream.read(buf.as_mut_slice()) {
-                        Ok(0) => {
-                            debug!("vsock: local connection closed unexpectedly");
-                            action = Action::RemoveFutureConn;
-                        },
-                        Ok(read_cnt) => {
-                            debug!("vsock: received data on local connection: {:?}", buf);
-                            buf.resize(read_cnt, 0);
-                            match std::str::from_utf8(buf.as_slice()) {
-                                Ok(s) => {
-                                    match s.trim().parse::<u32>() {
-                                        Ok(n) => {
-                                            debug!("vsock: got port number on local conn: {}", n);
-                                            action = Action::UpgradeFutureConn(n);
-                                        },
-                                        Err(e) => debug!("vsock: error parsing port no: {:?}", e),
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!("vsock: utf8 error parsing incoming command: {:?}", e);
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            if e.kind() != ErrorKind::WouldBlock {
-                                action = Action::RemoveFutureConn;
-                            }
-                        }
-                    }
-                },
-                None => ()
+                Ok(false) => ()
             }
         }
 
-        match action {
-            Action::HandleConnEvent(key) => {
-                if evset.contains(epoll::Events::EPOLLIN) {
-                    self.rxq.push_back(MuxerRx::ConnRx(key));
-                }
-                if evset.contains(epoll::Events::EPOLLOUT) {
-                    let mut unreg_tx: bool = false;
-                    let mut remove_conn: bool = false;
-                    {
-                        self.conn_map.entry(key).and_modify(|conn| {
-                            unreg_tx = match conn.try_flush_tx_buf() {
-                                Ok(drained) => drained,
-                                Err(e) => {
-                                    debug!(
-                                        "vsock: error flushing TX buffer for connection (s={}, d={})",
-                                        key.local_port, key.peer_port
-                                    );
-                                    remove_conn = true;
-                                    false
-                                }
-                            }
-                        });
-                    }
-                    if remove_conn {
-                        self.remove_connection(key);
-                    }
-                    else {
-                        // TODO: register/unregister EPOLLOUT here. Also check/add EPOLLOUT after send_pkt()
-                        // Also, clean up this messy code. Break it up into functions, maybe
-                        // add an impl EpollListener for modifying listener evset in-place.
-                        if unreg_tx {
-                        }
-                    }
-                }
-            },
-            Action::AddFutureConn(stream) => {
-                self.add_listener(
-                    stream.as_raw_fd(),
-                    EpollListener::FutureConn(stream)
-                ).unwrap_or_else(|e| {
-                    debug!("vsock muxer: error adding connection: {:?}", e);
-                });
-            },
-            Action::RemoveFutureConn => {
-                self.remove_listener(fd);
-            },
-            Action::UpgradeFutureConn(peer_port) => {
-
-                let local_port = match self.allocate_local_port() {
-                    Some(p) => p,
-                    None => {
-                        error!("vsock muxer: unable to allocate new local port");
-                        // This will also drop the FutureConn
-                        self.remove_listener(fd);
-                        return;
-                    }
-                };
-                let conn_key = ConnMapKey { local_port, peer_port };
-                if let Some(EpollListener::FutureConn(stream)) = self.remove_listener(fd) {
-                    let conn = VsockConnection::new_local_init(
-                        self.cid,
-                        local_port,
-                        peer_port,
-                        stream
-                    );
-                    self.add_connection(conn_key, conn, epoll::Events::EPOLLIN);
-                    self.rxq.push_back(MuxerRx::ConnRx(conn_key));
-                }
-                else {
-                    // TODO: We can only get here due to some coding error, so we should probably panic
-                }
-            },
-            Action::Nop => ()
+        if evset.contains(epoll::Events::EPOLLIN) {
+            self.rxq.push_back(MuxerRx::ConnRx(key));
         }
 
+        if new_evset != conn_evset {
+            self.modify_listener_evset(fd, new_evset)?;
+        }
+
+        Ok(())
     }
 
-    fn add_connection(&mut self, key: ConnMapKey, conn: VsockConnection, evset: epoll::Events) {
+    fn read_local_stream_port(stream: &mut UnixStream) -> Result<u32> {
+        // TODO: Check input more thoroughly, define it better
+        let mut buf = [0u8; 32];
+        match stream.read(&mut buf) {
+            Ok(0) => Err(Error::BrokenPipe),
+            Err(e) => Err(Error::IoError(e)),
+            Ok(read_cnt) => {
+                match std::str::from_utf8(buf.chunks(read_cnt).next().unwrap()) {
+                    Ok(s) => {
+                        s.trim().parse::<u32>().map_err(|_| Error::ProtocolError)
+                    }
+                    Err(err) => {
+                        error!("vsock muxer: invalid data read from local stream: {:?}", err);
+                        Err(Error::ProtocolError)
+                    }
+                }
+            }
+        }
+    }
+
+
+    fn add_connection(&mut self, key: ConnMapKey, conn: VsockConnection) -> Result<()> {
 
         self.add_listener(
             conn.as_raw_fd(),
-            EpollListener::Connection {key, evset}
+            EpollListener::Connection {key, evset: epoll::Events::EPOLLIN}
         ).and_then(|_| {
             self.conn_map.insert(key, conn);
             Ok(())
-        }).unwrap_or_else(|e| {
-            debug!("vsock muxer: error adding listener: {:?}", e);
-        });
-
+        }).map_err(|err| {
+            debug!("vsock muxer: error adding listener: {:?}", err);
+            err
+        })
     }
 
     fn remove_connection(&mut self, key: ConnMapKey) {
+        // TODO: clean this up
         let fd;
         {
             fd = match self.conn_map.get(&key) {
@@ -258,33 +258,15 @@ impl VsockMuxer {
             EpollListener::RxSock => epoll::Events::EPOLLIN,
         };
 
-
-        // TODO: do we need this ctl_mod here?
-        if self.listener_map.contains_key(&fd) {
-            epoll::ctl(
-                self.epoll_fd,
-                epoll::ControlOptions::EPOLL_CTL_MOD,
-                fd,
-                epoll::Event::new(evset, fd as u64),
-            ).or_else(|e| {
-                self.listener_map.remove(&fd);
-                Err(e)
-            }).map_err(Error::EpollCtl)?;
-            self.listener_map.entry(fd)
-                .and_modify(|old_listener| *old_listener = listener);
-        }
-        else {
-            epoll::ctl(
-                self.epoll_fd,
-                epoll::ControlOptions::EPOLL_CTL_ADD,
-                fd,
-                epoll::Event::new(evset, fd as u64),
-            ).and_then(|_| {
-                self.listener_map.insert(fd, listener);
-                Ok(())
-            }).map_err(Error::EpollCtl)?;
-
-        }
+        epoll::ctl(
+            self.epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            fd,
+            epoll::Event::new(evset, fd as u64),
+        ).and_then(|_| {
+            self.listener_map.insert(fd, listener);
+            Ok(())
+        }).map_err(Error::IoError)?;
 
         Ok(())
     }
@@ -296,14 +278,20 @@ impl VsockMuxer {
             epoll::ControlOptions::EPOLL_CTL_DEL,
             fd,
             epoll::Event::new(epoll::Events::empty(), 0)
-        ).unwrap_or_else(|e| {
-            if e.kind() != ErrorKind::NotFound {
-                // TODO: EPOLL_CTL_DEL should only fail with ENOENT on a valid epoll fd
-                // should we panic?
-            }
+        ).unwrap_or_else(|err| {
+            error!("vosck muxer: error removing epoll listener for fd {:?}: {:?}", fd, err);
         });
 
         self.listener_map.remove(&fd)
+    }
+
+    fn modify_listener_evset(&mut self, fd: RawFd, evset: epoll::Events) -> Result<()> {
+        epoll::ctl(
+            self.epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_MOD,
+            fd,
+            epoll::Event::new(evset, fd as u64)
+        ).map_err(Error::IoError)
     }
 
     fn allocate_local_port(&mut self) -> Option<u32> {
@@ -400,15 +388,18 @@ impl VsockBackend for VsockMuxer {
             ) {
                 Ok(conn) => {
                     debug!("vsock: new connection to local:{}", pkt.hdr.dst_port);
-                    self.add_connection(conn_key, conn, epoll::Events::EPOLLIN);
-
-                    // TODO: initialize a proper packet
-                    self.rxq.push_back(MuxerRx::Packet(VsockPacket::new_response(
-                        uapi::VSOCK_HOST_CID,
-                        self.cid,
-                        pkt.hdr.dst_port,
-                        pkt.hdr.src_port
-                    )));
+                    self.add_connection(conn_key, conn).and_then(|_| {
+                        // TODO: initialize a proper packet
+                        self.rxq.push_back(MuxerRx::Packet(VsockPacket::new_response(
+                            uapi::VSOCK_HOST_CID,
+                            self.cid,
+                            pkt.hdr.dst_port,
+                            pkt.hdr.src_port
+                        )));
+                        Ok(())
+                    }).unwrap_or_else(|e| {
+                        error!("vsock muxer: error adding connection: {:?}", e);
+                    });
                 },
                 Err(e) => {
                     debug!(
@@ -436,25 +427,41 @@ impl VsockBackend for VsockMuxer {
             return true;
         }
 
-        let mut remove_conn = false;
-
+        let mut send_result = Ok(true);
+        let mut conn_fd: RawFd = 0;
         self.conn_map.entry(conn_key).and_modify(|conn| {
-            if let Err(err) = conn.send_pkt(pkt) {
-                remove_conn = true;
-                debug!(
-                    "vsock: error sending pkt on (src={}, dst={}): {:?}",
-                    conn_key.local_port,
-                    conn_key.peer_port,
-                    err
+            send_result = conn.send_pkt(pkt);
+            conn_fd = conn.as_raw_fd();
+        });
+        match send_result {
+            Ok(drained) => {
+                if let Some(EpollListener::Connection {evset, ..}) = self.listener_map.get_mut(&conn_fd) {
+                    if drained == evset.contains(epoll::Events::EPOLLOUT) {
+                        if drained {
+                            evset.remove(epoll::Events::EPOLLOUT);
+                        }
+                        else {
+                            evset.insert(epoll::Events::EPOLLOUT);
+                        }
+                        let _evs = *evset;
+                        self.modify_listener_evset(conn_fd, _evs)
+                            .unwrap_or_else(|err| {
+                                error!(
+                                    "vsock muxer: error modifying epoll listener for connection (lp={}, pp={}): {:?}",
+                                    conn_key.local_port, conn_key.peer_port, err
+                                );
+                                self.remove_connection(conn_key);
+                            });
+                    }
+                }
+            }
+            Err(err) => {
+                self.remove_connection(conn_key);
+                error!(
+                    "vsock muxer: error sending data on connection (lp={}, pp={}): {:?}",
+                    conn_key.local_port, conn_key.peer_port, err
                 );
             }
-        });
-
-        if remove_conn {
-            self.remove_connection(conn_key);
-        }
-        else {
-            self.rxq.push_back(MuxerRx::ConnRx(conn_key));
         }
 
         true

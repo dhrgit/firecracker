@@ -13,7 +13,7 @@ use super::{Error, Result, VSOCK_TX_BUF_SIZE, TEMP_VSOCK_PATH};
 
 
 #[derive(Debug, PartialEq)]
-pub enum VsockConnectionState {
+pub enum ConnState {
     LocalInit,
     Established,
     LocalClosed,
@@ -21,7 +21,8 @@ pub enum VsockConnectionState {
 }
 
 pub struct VsockConnection {
-    pub state: VsockConnectionState,
+
+    state: ConnState,
 
     peer_cid: u64,
     local_port: u32,
@@ -61,7 +62,7 @@ impl VsockConnection {
                     local_port,
                     peer_port,
                     stream,
-                    state: VsockConnectionState::Established,
+                    state: ConnState::Established,
                     tx_buf: Vec::with_capacity(VSOCK_TX_BUF_SIZE),
                     buf_alloc: VSOCK_TX_BUF_SIZE as u32,
                     fwd_cnt: Wrapping(0),
@@ -86,7 +87,7 @@ impl VsockConnection {
             local_port,
             peer_port,
             stream,
-            state: VsockConnectionState::LocalInit,
+            state: ConnState::LocalInit,
             tx_buf: Vec::with_capacity(VSOCK_TX_BUF_SIZE),
             buf_alloc: VSOCK_TX_BUF_SIZE as u32,
             fwd_cnt: Wrapping(0),
@@ -97,41 +98,43 @@ impl VsockConnection {
         }
     }
 
-    pub fn send_pkt(&mut self, pkt: VsockPacket) -> Result<()> {
+    // true -> tx buf empty
+    // false -> data waiting in tx buf
+    pub fn send_pkt(&mut self, pkt: VsockPacket) -> Result<bool> {
 
         // TODO: finish up this state machine
 
         match self.state {
 
-            VsockConnectionState::LocalInit
+            ConnState::LocalInit
             if pkt.hdr.op == uapi::VSOCK_OP_RESPONSE => {
-                self.state = VsockConnectionState::Established;
+                self.state = ConnState::Established;
             },
 
-            VsockConnectionState::Established | VsockConnectionState::PeerClosed(_, false)
+            ConnState::Established | ConnState::PeerClosed(_, false)
             if pkt.hdr.op == uapi::VSOCK_OP_RW => {
                 self.send_bytes(pkt.buf.as_slice())?;
             },
 
-            VsockConnectionState::Established | VsockConnectionState::LocalClosed
+            ConnState::Established | ConnState::LocalClosed
             if pkt.hdr.op == uapi::VSOCK_OP_SHUTDOWN => {
-                self.state = VsockConnectionState::PeerClosed(
+                self.state = ConnState::PeerClosed(
                     pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0,
                     pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0,
                 );
                 // TODO: arm kill timer and RST
             },
 
-            VsockConnectionState::PeerClosed(rcv, snd)
+            ConnState::PeerClosed(rcv, snd)
             if pkt.hdr.op == uapi::VSOCK_OP_SHUTDOWN => {
-                self.state = VsockConnectionState::PeerClosed(
+                self.state = ConnState::PeerClosed(
                     rcv || (pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0),
                     snd || (pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0),
                 );
                 // TODO: arm kill timer and RST
             },
 
-            VsockConnectionState::LocalClosed => {
+            ConnState::LocalClosed => {
                 // Only RST is valid in this state, and that would have been handled by the muxer.
                 debug!("vsock: received bad pkt op={}; terminating connection", pkt.hdr.op);
                 return Err(Error::FatalPkt);
@@ -154,14 +157,14 @@ impl VsockConnection {
                     pkt.hdr.op,
                     pkt.hdr.len,
                 );
-                return Ok(());
+                return Ok(self.tx_buf.len() == 0);
             }
         }
 
         self.peer_buf_alloc = pkt.hdr.buf_alloc;
         self.peer_fwd_cnt = Wrapping(pkt.hdr.fwd_cnt);
 
-        Ok(())
+        Ok(self.tx_buf.len() == 0)
     }
 
     pub fn recv_pkt(&mut self, max_len: usize) -> Option<VsockPacket> {
@@ -174,12 +177,12 @@ impl VsockConnection {
             self.tx_buf.len()
         );
 
-        if self.state == VsockConnectionState::LocalClosed
-            || (self.state == VsockConnectionState::PeerClosed(true, true) && self.tx_buf.len() == 0) {
+        if self.state == ConnState::LocalClosed
+            || (self.state == ConnState::PeerClosed(true, true) && self.tx_buf.len() == 0) {
             return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_RST, 0, None));
         }
 
-        if self.state == VsockConnectionState::LocalInit {
+        if self.state == ConnState::LocalInit {
             return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_REQUEST, 0, None));
         }
 
@@ -206,7 +209,7 @@ impl VsockConnection {
         let pkt = match self.stream.read(buf.as_mut_slice()) {
             Ok(read_cnt) => {
                 if read_cnt == 0 {
-                    self.state = VsockConnectionState::LocalClosed;
+                    self.state = ConnState::LocalClosed;
                     self.build_pkt_for_peer(
                         uapi::VSOCK_OP_SHUTDOWN,
                         uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
@@ -238,7 +241,7 @@ impl VsockConnection {
     // TODO: do we need this return value?
     fn send_bytes(&mut self, buf: &[u8]) -> Result<bool> {
 
-        match self.try_flush_tx_buf() {
+        match self.flush_tx_buf() {
             Err(e) => Err(e),
             Ok(false) => {
                 self.push_to_tx_buf(buf)?;
@@ -270,7 +273,7 @@ impl VsockConnection {
 
     // true -> tx buf empty
     // false -> some data still in tx buf
-    pub fn try_flush_tx_buf(&mut self) -> Result<bool> {
+    pub fn flush_tx_buf(&mut self) -> Result<bool> {
 
         if self.tx_buf.len() == 0 {
             return Ok(true);

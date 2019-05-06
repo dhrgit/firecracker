@@ -11,9 +11,10 @@ const TEMP_VSOCK_PATH: &str = "./vsock";
 
 #[derive(Debug)]
 pub enum Error {
+    BrokenPipe,
     BufferFull,
-    EpollCtl(std::io::Error),
     FatalPkt,
     IoError(std::io::Error),
+    ProtocolError,
 }
 type Result<T> = std::result::Result<T, Error>;
