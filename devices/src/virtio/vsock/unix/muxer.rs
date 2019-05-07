@@ -4,7 +4,6 @@
 
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::collections::hash_map::{Entry};
 use std::io::{Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::io::{RawFd, AsRawFd};
@@ -13,7 +12,7 @@ use super::super::defs::uapi;
 use super::super::packet::{VsockPacket};
 use super::super::VsockBackend;
 use super::connection::VsockConnection;
-use super::{Error, Result, TEMP_VSOCK_PATH};
+use super::{Error, Result};
 
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -30,7 +29,7 @@ enum MuxerRx {
 
 enum EpollListener {
     Connection { key: ConnMapKey, evset: epoll::Events },
-    RxSock,
+    HostSock,
     FutureConn(UnixStream),
 }
 
@@ -39,41 +38,38 @@ pub struct VsockMuxer {
     conn_map: HashMap<ConnMapKey, VsockConnection>,
     listener_map: HashMap<RawFd, EpollListener>,
     cid: u64,
+    host_sock: UnixListener,
+    host_sock_path: String,
     epoll_fd: RawFd,
-    rx_sock: UnixListener,
     local_port_set: HashSet<u32>,
     local_port_last: u32,
 }
 
 impl VsockMuxer {
-    pub fn new(cid: u64, epoll_fd: RawFd) -> Self {
+
+    pub fn new(
+        cid: u64,
+        host_sock: UnixListener,
+        host_sock_path: String,
+        epoll_fd: RawFd
+    ) -> Result<Self> {
+
+        let host_sock_fd = host_sock.as_raw_fd();
+
         let mut muxer = Self {
             rxq: VecDeque::new(),
             conn_map: HashMap::new(),
             listener_map: HashMap::new(),
             cid,
+            host_sock,
+            host_sock_path,
             epoll_fd,
-            rx_sock: UnixListener::bind(TEMP_VSOCK_PATH).unwrap(),
             local_port_last: (1u32 << 31),
             local_port_set: HashSet::new(),
         };
 
-        // TODO: have rx_sock provided by the VMM, before seccomp application
-        // and get rid of these unwraps.
-
-        epoll::ctl(
-            muxer.epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_ADD,
-            muxer.rx_sock.as_raw_fd(),
-            epoll::Event::new(epoll::Events::EPOLLIN, muxer.rx_sock.as_raw_fd() as u64)
-        ).unwrap();
-
-        muxer.rx_sock.set_nonblocking(true).unwrap();
-        muxer.listener_map.insert(
-            muxer.rx_sock.as_raw_fd(),
-            EpollListener::RxSock
-        );
-        muxer
+        muxer.add_listener(host_sock_fd, EpollListener::HostSock)?;
+        Ok(muxer)
     }
 
 
@@ -97,8 +93,8 @@ impl VsockMuxer {
                 }
             },
 
-            Some(EpollListener::RxSock) => {
-                match self.rx_sock.accept() {
+            Some(EpollListener::HostSock) => {
+                match self.host_sock.accept() {
                     Ok((stream, name)) => {
                         match stream.set_nonblocking(true) {
                             Err(err) => {
@@ -232,21 +228,10 @@ impl VsockMuxer {
     }
 
     fn remove_connection(&mut self, key: ConnMapKey) {
-        // TODO: clean this up
-        let fd;
-        {
-            fd = match self.conn_map.get(&key) {
-                Some(conn) => conn.as_raw_fd(),
-                None => return,
-            };
+        if let Some(conn) = self.conn_map.get(&key) {
+            self.remove_listener(conn.as_raw_fd());
         }
-        self.remove_listener(fd);
-
-        {
-            if let Entry::Occupied(ent) = self.conn_map.entry(key) {
-                ent.remove();
-            }
-        }
+        self.conn_map.remove(&key);
         self.free_local_port(key.local_port);
     }
 
@@ -255,7 +240,7 @@ impl VsockMuxer {
         let evset = match listener {
             EpollListener::Connection {evset, ..} => evset,
             EpollListener::FutureConn(_) => epoll::Events::EPOLLIN,
-            EpollListener::RxSock => epoll::Events::EPOLLIN,
+            EpollListener::HostSock => epoll::Events::EPOLLIN,
         };
 
         epoll::ctl(
@@ -318,6 +303,35 @@ impl VsockMuxer {
         self.local_port_set.remove(&port);
     }
 
+    fn handle_peer_request_pkt(&mut self, pkt: &VsockPacket) -> Result<()> {
+
+        let port_path = format!("{}_{}", self.host_sock_path, pkt.hdr.dst_port);
+        let stream = UnixStream::connect(port_path)
+            .and_then(|stream| {
+                stream.set_nonblocking(true).map(|_| stream)
+            })
+            .map_err(Error::IoError)?;
+
+        let conn_key = ConnMapKey {
+            local_port: pkt.hdr.dst_port,
+            peer_port: pkt.hdr.src_port,
+        };
+        let conn = VsockConnection::new_peer_init(
+            stream,
+            self.cid,
+            pkt.hdr.dst_port,
+            pkt.hdr.src_port,
+            pkt.hdr.buf_alloc,
+        );
+        self.add_connection(conn_key, conn)
+            .and_then(|_| {
+                self.rxq.push_back(MuxerRx::ConnRx(conn_key));
+                Ok(())
+            })?;
+
+        Ok(())
+    }
+
 }
 
 impl VsockBackend for VsockMuxer {
@@ -376,47 +390,24 @@ impl VsockBackend for VsockMuxer {
 
         if !self.conn_map.contains_key(&conn_key) {
             if pkt.hdr.op != uapi::VSOCK_OP_REQUEST {
-                debug!("vsock: dropping unexpected packet from guest, op={}", pkt.hdr.op);
+                info!("vsock muxer: dropping unexpected packet from guest: {:?}", pkt.hdr);
                 return true;
             }
 
-            match VsockConnection::new_peer_init(
-                self.cid,
-                pkt.hdr.dst_port,
-                pkt.hdr.src_port,
-                pkt.hdr.buf_alloc,
-            ) {
-                Ok(conn) => {
-                    debug!("vsock: new connection to local:{}", pkt.hdr.dst_port);
-                    self.add_connection(conn_key, conn).and_then(|_| {
-                        // TODO: initialize a proper packet
-                        self.rxq.push_back(MuxerRx::Packet(VsockPacket::new_response(
-                            uapi::VSOCK_HOST_CID,
-                            self.cid,
-                            pkt.hdr.dst_port,
-                            pkt.hdr.src_port
-                        )));
-                        Ok(())
-                    }).unwrap_or_else(|e| {
-                        error!("vsock muxer: error adding connection: {:?}", e);
-                    });
-                },
-                Err(e) => {
-                    debug!(
-                        "vsock: error establishing unix connection (src={}, dst={}): {:?}",
-                        pkt.hdr.src_port,
-                        pkt.hdr.dst_port,
-                        e
-                    );
-
-                    // TODO: initialize a proper packet
+            match self.handle_peer_request_pkt(&pkt) {
+                Ok(()) => self.rxq.push_back(MuxerRx::ConnRx(conn_key)),
+                Err(err) => {
                     self.rxq.push_back(MuxerRx::Packet(VsockPacket::new_rst(
-                        uapi::VSOCK_HOST_CID,
                         self.cid,
+                        pkt.hdr.src_cid,
                         pkt.hdr.dst_port,
                         pkt.hdr.src_port
                     )));
-                },
+                    info!(
+                        "vsock muxer: error accepting connection request from guest (lp={}, pp={}): {:?}",
+                        conn_key.local_port, conn_key.peer_port, err
+                    );
+                }
             }
 
             return true;

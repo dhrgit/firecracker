@@ -9,12 +9,13 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use super::super::packet::{VsockPacket, VsockPacketHdr};
 use super::super::defs::uapi;
-use super::{Error, Result, VSOCK_TX_BUF_SIZE, TEMP_VSOCK_PATH};
+use super::{Error, Result, VSOCK_TX_BUF_SIZE};
 
 
 #[derive(Debug, PartialEq)]
 pub enum ConnState {
     LocalInit,
+    PeerInit,
     Established,
     LocalClosed,
     PeerClosed(bool, bool),
@@ -47,32 +48,26 @@ pub struct VsockConnection {
 impl VsockConnection {
 
     pub fn new_peer_init(
+        stream: UnixStream,
         peer_cid: u64,
         local_port: u32,
         peer_port: u32,
-        peer_buf_alloc: u32
-    ) -> Result<Self> {
+        peer_buf_alloc: u32,
+    ) -> Self {
 
-        match UnixStream::connect(format!("{}_{}", TEMP_VSOCK_PATH, local_port)) {
-            Ok(stream) => {
-                stream.set_nonblocking(true)
-                    .map_err(Error::IoError)?;
-                Ok(Self {
-                    peer_cid,
-                    local_port,
-                    peer_port,
-                    stream,
-                    state: ConnState::Established,
-                    tx_buf: Vec::with_capacity(VSOCK_TX_BUF_SIZE),
-                    buf_alloc: VSOCK_TX_BUF_SIZE as u32,
-                    fwd_cnt: Wrapping(0),
-                    peer_buf_alloc,
-                    peer_fwd_cnt: Wrapping(0),
-                    rx_cnt: Wrapping(0),
-                    last_fwd_cnt_to_peer: Wrapping(0),
-                })
-            },
-            Err(e) => Err(Error::IoError(e))
+        Self {
+            peer_cid,
+            local_port,
+            peer_port,
+            stream,
+            state: ConnState::PeerInit,
+            tx_buf: Vec::new(),
+            buf_alloc: VSOCK_TX_BUF_SIZE as u32,
+            fwd_cnt: Wrapping(0),
+            peer_buf_alloc,
+            peer_fwd_cnt: Wrapping(0),
+            rx_cnt: Wrapping(0),
+            last_fwd_cnt_to_peer: Wrapping(0),
         }
     }
 
@@ -88,7 +83,7 @@ impl VsockConnection {
             peer_port,
             stream,
             state: ConnState::LocalInit,
-            tx_buf: Vec::with_capacity(VSOCK_TX_BUF_SIZE),
+            tx_buf: Vec::new(),
             buf_alloc: VSOCK_TX_BUF_SIZE as u32,
             fwd_cnt: Wrapping(0),
             peer_buf_alloc: 0,
@@ -169,7 +164,7 @@ impl VsockConnection {
 
     pub fn recv_pkt(&mut self, max_len: usize) -> Option<VsockPacket> {
 
-        // TODO: check state and act accordingly
+        // TODO: clean this up
 
         debug!(
             "vsock: conn.recv_pkt(): state={:?}, tx_buf.len={}",
@@ -180,6 +175,11 @@ impl VsockConnection {
         if self.state == ConnState::LocalClosed
             || (self.state == ConnState::PeerClosed(true, true) && self.tx_buf.len() == 0) {
             return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_RST, 0, None));
+        }
+
+        if self.state == ConnState::PeerInit {
+            self.state = ConnState::Established;
+            return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_RESPONSE, 0, None));
         }
 
         if self.state == ConnState::LocalInit {

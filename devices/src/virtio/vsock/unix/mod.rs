@@ -7,7 +7,6 @@ mod connection;
 
 const VSOCK_TX_BUF_SIZE: usize = 256*1024;
 
-const TEMP_VSOCK_PATH: &str = "./vsock";
 
 #[derive(Debug)]
 pub enum Error {

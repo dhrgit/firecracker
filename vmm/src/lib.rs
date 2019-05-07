@@ -983,8 +983,11 @@ impl Vmm {
 
             let epoll_config = self.epoll_context.allocate_virtio_vsock_tokens();
             let vsock_box = Box::new(
-                devices::virtio::Vsock::new(u64::from(cfg.guest_cid), epoll_config)
-                    .or(Err(StartMicrovmError::CreateVsockDevice))?,
+                devices::virtio::Vsock::new(
+                    u64::from(cfg.guest_cid),
+                    cfg.uds_path.clone(),
+                    epoll_config
+                ).or(Err(StartMicrovmError::CreateVsockDevice))?,
             );
             device_manager
                 .register_virtio_device(

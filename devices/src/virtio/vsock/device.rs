@@ -1,6 +1,7 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
-use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixListener;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -10,6 +11,7 @@ use memory_model::GuestMemory;
 use sys_util::EventFd;
 
 use super::super::{ActivateError, ActivateResult, Queue as VirtQueue, VirtioDevice};
+use super::VsockError;
 use super::epoll_handler::VsockEpollHandler;
 use super::unix::muxer::VsockMuxer;
 use super::{EpollConfig, defs, defs::uapi};
@@ -17,6 +19,9 @@ use super::{EpollConfig, defs, defs::uapi};
 
 pub struct Vsock {
     cid: u64,
+    host_sock: Option<UnixListener>,
+    host_sock_path: Option<String>,
+    backend_epoll_fd: RawFd,
     avail_features: u64,
     acked_features: u64,
     config_space: Vec<u8>,
@@ -25,9 +30,26 @@ pub struct Vsock {
 
 impl Vsock {
     /// Create a new virtio-vsock device with the given VM cid.
-    pub fn new(cid: u64, epoll_config: EpollConfig) -> super::Result<Vsock> {
+    pub fn new(
+        cid: u64,
+        host_sock_path: String,
+        epoll_config: EpollConfig
+    ) -> super::Result<Vsock> {
+
+        // TODO: report these possible errors more accurately
+        let host_sock = UnixListener::bind(&host_sock_path)
+            .and_then(|sock| {
+                sock.set_nonblocking(true).map(|_| sock)
+            })
+            .map_err(VsockError::IoError)?;
+        let backend_epoll_fd = epoll::create(true)
+            .map_err(VsockError::IoError)?;
+
         Ok(Vsock {
             cid,
+            host_sock: Some(host_sock),
+            host_sock_path: Some(host_sock_path),
+            backend_epoll_fd,
             avail_features: 1u64 << uapi::VIRTIO_F_VERSION_1 | 1u64 << uapi::VIRTIO_F_IN_ORDER,
             acked_features: 0,
             config_space: Vec::new(),
@@ -135,7 +157,16 @@ impl VirtioDevice for Vsock {
         let rxvq_evt = queue_evts.remove(0);
         let txvq_evt = queue_evts.remove(0);
         let evq_evt = queue_evts.remove(0);
-        let backend_epoll_rawfd = epoll::create(true).map_err(ActivateError::EpollCtl)?;
+        let muxer = VsockMuxer::new(
+            self.cid,
+            self.host_sock.take().unwrap(),
+            self.host_sock_path.take().unwrap(),
+            self.backend_epoll_fd
+        ).map_err(|err| {
+                ActivateError::VsockError(VsockError::BackendError(
+                    format!("{:?}", err)
+                ))
+            })?;
 
         let handler: VsockEpollHandler<VsockMuxer> = VsockEpollHandler {
             rxvq,
@@ -148,7 +179,7 @@ impl VirtioDevice for Vsock {
             cid: self.cid,
             interrupt_status,
             interrupt_evt,
-            backend: VsockMuxer::new(self.cid, backend_epoll_rawfd),
+            backend: muxer,
         };
         let rx_queue_rawfd = handler.rxvq_evt.as_raw_fd();
         let tx_queue_rawfd = handler.txvq_evt.as_raw_fd();
@@ -187,7 +218,7 @@ impl VirtioDevice for Vsock {
         epoll::ctl(
             self.epoll_config.epoll_raw_fd,
             epoll::ControlOptions::EPOLL_CTL_ADD,
-            backend_epoll_rawfd,
+            self.backend_epoll_fd,
             epoll::Event::new(epoll::Events::EPOLLIN, self.epoll_config.backend_token),
         ).map_err(ActivateError::EpollCtl)?;
 

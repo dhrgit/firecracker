@@ -71,6 +71,11 @@ mod defs {
 pub enum VsockError {
     PacketAssemblyError,
     GeneralError,
+
+    IoError(std::io::Error),
+
+    // TODO: look into use a generic here, instead of collapsing the downstream error into a string
+    BackendError(String),
 }
 type Result<T> = std::result::Result<T, VsockError>;
 

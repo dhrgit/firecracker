@@ -11,8 +11,10 @@ use std::result;
 pub struct VsockDeviceConfig {
     /// ID of the vsock device.
     pub id: String,
-    /// A 32-bit Context Identifier (CID) used to identify the guest.
+    /// A 64-bit Context Identifier (CID) used to identify the guest.
     pub guest_cid: u32,
+    /// Path to local unix socket.
+    pub uds_path: String,
 }
 
 /// Errors associated with `VsockDeviceConfig`.

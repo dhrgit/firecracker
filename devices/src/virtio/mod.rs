@@ -48,6 +48,7 @@ pub const NOTIFY_REG_OFFSET: u32 = 0x50;
 pub enum ActivateError {
     EpollCtl(IOError),
     BadActivate,
+    VsockError(self::vsock::VsockError),
 }
 
 pub type ActivateResult = std::result::Result<(), ActivateError>;
