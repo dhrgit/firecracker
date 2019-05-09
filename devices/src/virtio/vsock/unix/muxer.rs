@@ -84,7 +84,7 @@ impl VsockMuxer {
                     Ok(()) => (),
                     Err(err) => {
                         error!(
-                            "vsock muxer: error processing connection event: {:?}",
+                            "vsock: error processing connection event: {:?}",
                             err
                         );
                         self.remove_connection(conn_key_copy);
@@ -99,25 +99,25 @@ impl VsockMuxer {
                         match stream.set_nonblocking(true) {
                             Err(err) => {
                                 error!(
-                                    "vsock muxer: unable to set local connection non-blocking: {:?}",
+                                    "vsock: unable to set local connection non-blocking: {:?}",
                                     err
                                 );
                             },
                             Ok(()) => ()
                         }
-                        debug!("vsock muxer: new local connection: {:?}", name);
+                        debug!("vsock: new local connection: {:?}", name);
                         self.add_listener(
                             stream.as_raw_fd(),
                             EpollListener::FutureConn(stream)
                         ).unwrap_or_else(|err| {
                             error!(
-                                "vsock muxer: unable to add listener for local connection: {:?}",
+                                "vsock: unable to add listener for local connection: {:?}",
                                 err
                             );
                         });
                     },
                     Err(err) => {
-                        error!("vsock muxer: error accepting local connection: {:?}", err);
+                        error!("vsock: error accepting local connection: {:?}", err);
                     }
                 }
             },
@@ -126,7 +126,7 @@ impl VsockMuxer {
                 if let Some(EpollListener::FutureConn(mut stream)) = self.remove_listener(fd) {
                     match Self::read_local_stream_port(&mut stream) {
                         Err(err) => {
-                            error!("vsock muxer: error reading port from local stream: {:?}", err);
+                            error!("vsock: error reading port from local stream: {:?}", err);
                         },
                         Ok(peer_port) => {
                             if let Some(local_port) = self.allocate_local_port() {
@@ -143,7 +143,7 @@ impl VsockMuxer {
                                     self.rxq.push_back(MuxerRx::ConnRx(conn_key));
                                     Ok(())
                                 }).unwrap_or_else(|err| {
-                                    error!("vsock muxer: error adding connection: {:?}", err);
+                                    error!("vsock: error adding connection: {:?}", err);
                                 });
                             }
                         }
@@ -152,7 +152,7 @@ impl VsockMuxer {
             }
 
             _ => {
-                warn!("vsock muxer: unexpected event: fd={:?}, evset={:?}", fd, evset);
+                warn!("vsock: unexpected event: fd={:?}, evset={:?}", fd, evset);
             },
         }
     }
@@ -204,7 +204,7 @@ impl VsockMuxer {
                         s.trim().parse::<u32>().map_err(|_| Error::ProtocolError)
                     }
                     Err(err) => {
-                        error!("vsock muxer: invalid data read from local stream: {:?}", err);
+                        error!("vsock: invalid data read from local stream: {:?}", err);
                         Err(Error::ProtocolError)
                     }
                 }
@@ -222,7 +222,7 @@ impl VsockMuxer {
             self.conn_map.insert(key, conn);
             Ok(())
         }).map_err(|err| {
-            debug!("vsock muxer: error adding listener: {:?}", err);
+            debug!("vsock: error adding listener: {:?}", err);
             err
         })
     }
@@ -342,7 +342,7 @@ impl VsockBackend for VsockMuxer {
 
     fn notify(&mut self, _: epoll::Events) {
 
-        debug!("vsock muxer: received kick");
+        debug!("vsock: received kick");
 
         let mut epoll_events = vec![epoll::Event::new(epoll::Events::empty(), 0); 16].into_boxed_slice();
         match epoll::wait(self.epoll_fd, 0, &mut epoll_events[..]) {
@@ -390,7 +390,7 @@ impl VsockBackend for VsockMuxer {
 
         if !self.conn_map.contains_key(&conn_key) {
             if pkt.hdr.op != uapi::VSOCK_OP_REQUEST {
-                info!("vsock muxer: dropping unexpected packet from guest: {:?}", pkt.hdr);
+                info!("vsock: dropping unexpected packet from guest: {:?}", pkt.hdr);
                 return true;
             }
 
@@ -404,7 +404,7 @@ impl VsockBackend for VsockMuxer {
                         pkt.hdr.src_port
                     )));
                     info!(
-                        "vsock muxer: error accepting connection request from guest (lp={}, pp={}): {:?}",
+                        "vsock: error accepting connection request from guest (lp={}, pp={}): {:?}",
                         conn_key.local_port, conn_key.peer_port, err
                     );
                 }
@@ -438,10 +438,11 @@ impl VsockBackend for VsockMuxer {
                         self.modify_listener_evset(conn_fd, _evs)
                             .unwrap_or_else(|err| {
                                 error!(
-                                    "vsock muxer: error modifying epoll listener for connection (lp={}, pp={}): {:?}",
+                                    "vsock: error modifying epoll listener for connection (lp={}, pp={}): {:?}",
                                     conn_key.local_port, conn_key.peer_port, err
                                 );
                                 self.remove_connection(conn_key);
+                                // TODO: send RST
                             });
                     }
                 }
@@ -449,9 +450,10 @@ impl VsockBackend for VsockMuxer {
             Err(err) => {
                 self.remove_connection(conn_key);
                 error!(
-                    "vsock muxer: error sending data on connection (lp={}, pp={}): {:?}",
+                    "vsock: error sending data on connection (lp={}, pp={}): {:?}",
                     conn_key.local_port, conn_key.peer_port, err
                 );
+                // TODO: send RST
             }
         }
 
@@ -460,6 +462,7 @@ impl VsockBackend for VsockMuxer {
 
     fn recv_pkt(&mut self, max_len: usize) -> Option<VsockPacket> {
 
+        // TODO: if conn.recv_pkt returns None, try the next item in self.rxq
         let maybe_pkt = match self.rxq.pop_front() {
             Some(MuxerRx::Packet(pkt)) => {
                 Some(pkt)
@@ -473,6 +476,10 @@ impl VsockBackend for VsockMuxer {
             },
             None => None
         };
+
+
+        // TODO: figure out when to unregister connections from EPOLLIN stream events
+        // Also, host-incoming connections might need to get dropped if the dirver locked the RX q
 
         // Look for locally issued RSTs, in which case we need to remove the connection.
         //

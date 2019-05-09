@@ -97,18 +97,15 @@ impl VsockConnection {
     // false -> data waiting in tx buf
     pub fn send_pkt(&mut self, pkt: VsockPacket) -> Result<bool> {
 
-        // TODO: finish up this state machine
-
         match self.state {
-
-            ConnState::LocalInit
-            if pkt.hdr.op == uapi::VSOCK_OP_RESPONSE => {
-                self.state = ConnState::Established;
-            },
 
             ConnState::Established | ConnState::PeerClosed(_, false)
             if pkt.hdr.op == uapi::VSOCK_OP_RW => {
                 self.send_bytes(pkt.buf.as_slice())?;
+            },
+
+            ConnState::LocalInit if pkt.hdr.op == uapi::VSOCK_OP_RESPONSE => {
+                self.state = ConnState::Established;
             },
 
             ConnState::Established | ConnState::LocalClosed
@@ -131,12 +128,12 @@ impl VsockConnection {
 
             ConnState::LocalClosed => {
                 // Only RST is valid in this state, and that would have been handled by the muxer.
-                debug!("vsock: received bad pkt op={}; terminating connection", pkt.hdr.op);
+                info!("vsock: dropping connection after bad packet from peer: {:?}", pkt.hdr);
                 return Err(Error::FatalPkt);
             },
 
             _ if pkt.hdr.op == uapi::VSOCK_OP_CREDIT_UPDATE => {
-                // Nothing to do here; will update peer credit later on.
+                // Nothing to do here; we'll update peer credit later on.
             },
 
             _ if pkt.hdr.op == uapi::VSOCK_OP_CREDIT_REQUEST => {
@@ -162,41 +159,40 @@ impl VsockConnection {
         Ok(self.tx_buf.len() == 0)
     }
 
-    pub fn recv_pkt(&mut self, max_len: usize) -> Option<VsockPacket> {
+    pub fn recv_pkt(&mut self, mut max_len: usize) -> Option<VsockPacket> {
 
-        // TODO: clean this up
-
-        debug!(
-            "vsock: conn.recv_pkt(): state={:?}, tx_buf.len={}",
-            self.state,
-            self.tx_buf.len()
-        );
-
-        if self.state == ConnState::LocalClosed
-            || (self.state == ConnState::PeerClosed(true, true) && self.tx_buf.len() == 0) {
-            return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_RST, 0, None));
+        match self.state {
+            ConnState::Established | ConnState::PeerClosed(false, _) => (),
+            ConnState::LocalClosed | ConnState::PeerClosed(true, _) => {
+                return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_RST, 0, None));
+            },
+            ConnState::PeerInit => {
+                self.state = ConnState::Established;
+                return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_RESPONSE, 0, None));
+            },
+            ConnState::LocalInit => {
+                return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_REQUEST, 0, None));
+            },
+            _ => {
+                return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_RST, 0, None));
+            }
         }
 
-        if self.state == ConnState::PeerInit {
-            self.state = ConnState::Established;
-            return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_RESPONSE, 0, None));
-        }
-
-        if self.state == ConnState::LocalInit {
-            return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_REQUEST, 0, None));
-        }
-
-        // TODO: this will keep asking for a credit update from peer, until it receives one.
-        if self.need_credit_update_from_peer() {
-            self.last_fwd_cnt_to_peer = self.fwd_cnt;
-            return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_CREDIT_REQUEST, 0, None));
-        }
         if self.peer_needs_credit_update() {
             self.last_fwd_cnt_to_peer = self.fwd_cnt;
             return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_CREDIT_UPDATE, 0, None));
         }
 
-        // Beyond this point, we'd need to produce a data packet. No point in trying that
+        if self.need_credit_update_from_peer() {
+            self.last_fwd_cnt_to_peer = self.fwd_cnt;
+            return Some(self.build_pkt_for_peer(uapi::VSOCK_OP_CREDIT_REQUEST, 0, None));
+        }
+
+        // `max_len` only tells us how much space the driver has made available in an RX buffer.
+        // We also need to consider how much credit the peer has left for this stream.
+        max_len = std::cmp::min(max_len, self.peer_avail_credit());
+
+        // Beyond this point, we'll need to produce a data packet. No point in trying that
         // if there's no buffer to store the data into.
         //
         if max_len == 0 {
@@ -225,8 +221,6 @@ impl VsockConnection {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
                     return None;
                 }
-                // TODO: maybe perform a graceful shutdown here as well?
-                // TODO: also, is returning an RST pkt here really better than Result<Option<pkt>>?
                 self.build_pkt_for_peer(uapi::VSOCK_OP_RST, 0, None)
             }
         };
@@ -238,9 +232,8 @@ impl VsockConnection {
 
     // true -> tx buf empty
     // false -> some data still in tx buf
-    // TODO: do we need this return value?
     fn send_bytes(&mut self, buf: &[u8]) -> Result<bool> {
-
+        // TODO: clean this up
         match self.flush_tx_buf() {
             Err(e) => Err(e),
             Ok(false) => {
@@ -301,18 +294,13 @@ impl VsockConnection {
         self.stream.as_raw_fd()
     }
 
-    pub fn avail_credit(&self) -> usize {
-        VSOCK_TX_BUF_SIZE - self.tx_buf.len()
-    }
-
     fn peer_needs_credit_update(&self) -> bool {
         // TODO: un-hardcode and clean this up
         (self.fwd_cnt - self.last_fwd_cnt_to_peer).0 > (self.buf_alloc - 8192)
     }
 
     fn need_credit_update_from_peer(&self) -> bool {
-        // TODO: un-hardcode and clean this up
-        self.peer_avail_credit() < 8192
+        self.peer_avail_credit() == 0
     }
 
     fn build_pkt_for_peer(&self, op: u16, flags: u32, buf: Option<Vec<u8>>) -> VsockPacket {
