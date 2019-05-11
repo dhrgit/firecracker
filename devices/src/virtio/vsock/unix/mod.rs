@@ -12,7 +12,6 @@ const VSOCK_TX_BUF_SIZE: usize = 256*1024;
 pub enum Error {
     BrokenPipe,
     BufferFull,
-    FatalPkt,
     IoError(std::io::Error),
     ProtocolError,
 }

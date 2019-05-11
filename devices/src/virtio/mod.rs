@@ -33,7 +33,6 @@ const DEVICE_FAILED: u32 = 0x80;
 /// Types taken from linux/virtio_ids.h.
 const TYPE_NET: u32 = 1;
 const TYPE_BLOCK: u32 = 2;
-const TYPE_VSOCK: u32 = 19;
 
 /// Interrupt flags (re: interrupt status & acknowledge registers).
 /// See linux/virtio_mmio.h.

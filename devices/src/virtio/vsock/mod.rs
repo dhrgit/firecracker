@@ -74,7 +74,7 @@ pub enum VsockError {
 
     IoError(std::io::Error),
 
-    // TODO: look into use a generic here, instead of collapsing the downstream error into a string
+    // TODO: look into using some generic here, instead of collapsing the downstream error into a string
     BackendError(String),
 }
 type Result<T> = std::result::Result<T, VsockError>;
