@@ -3,10 +3,6 @@
 //
 
 
-use std::cmp::min;
-
-use memory_model::GuestMemory;
-
 use super::super::DescriptorChain;
 use super::{Result, VsockError};
 use super::defs;
@@ -28,121 +24,138 @@ pub struct VsockPacketHdr {
     pub fwd_cnt: u32,
     pub _pad: u32,
 }
-const VSOCK_PKT_HDR_SIZE: usize = 44;
+impl VsockPacketHdr {
+    const SIZE: usize = 44;
 
-
-#[derive(Default)]
-pub struct VsockPacket {
-    pub hdr: VsockPacketHdr,
-    // TODO: maybe use an Option here?
-    pub buf: Vec<u8>,
-}
-
-impl VsockPacket {
-
-    pub fn from_virtq_head(head: &DescriptorChain, mem: &GuestMemory) -> Result<Self> {
-
-        // TODO: maybe publish and use head.mem, instead of receving it as an arg here?
-
-        if (head.len as usize) < VSOCK_PKT_HDR_SIZE {
-            warn!("vsock: framing error, TX desc head too small for packet header");
-            return Err(VsockError::PacketAssemblyError);
+    pub fn from_virtq_desc(desc: &DescriptorChain) -> Result<Self> {
+        if desc.is_write_only() {
+            return Err(VsockError::UnreadableDescriptor);
         }
-
-        if head.is_write_only() {
-            // TODO: return a proper error
-            return Err(VsockError::GeneralError);
+        if (desc.len as usize) < Self::SIZE {
+            return Err(VsockError::HdrDescTooSmall(desc.len));
         }
 
         let hdr = VsockPacketHdr::default();
-        mem.read_slice_at_addr(
+        desc.mem.read_slice_at_addr(
             unsafe {
                 std::slice::from_raw_parts_mut(
                     &hdr as *const _ as *mut u8,
-                    VSOCK_PKT_HDR_SIZE
+                    Self::SIZE
                 )
             },
-            head.addr
-        ).map_err(|_| VsockError::PacketAssemblyError)?;
+            desc.addr
+        ).map_err(VsockError::GuestMemory)?;
 
-        if hdr.len > defs::MAX_PKT_BUF_SIZE as u32 {
-            warn!("vsock: dropping TX packet with invalid len: {}", hdr.len);
-            return Err(VsockError::PacketAssemblyError);
-        }
-
-        let mut buf = vec![0u8; hdr.len as usize];
-        buf.resize(hdr.len as usize, 0);
-
-        let mut read_cnt = 0usize;
-        let mut maybe_desc = head.next_descriptor();
-        while let Some(desc) = maybe_desc {
-            if desc.is_write_only() {
-                // TODO: return a proper error
-                return Err(VsockError::GeneralError);
-            }
-            if read_cnt + (desc.len as usize) > (hdr.len as usize) {
-                info!("vsock: malformed TX packet, vring data > hdr.len");
-                return Err(VsockError::PacketAssemblyError);
-            }
-            mem.read_slice_at_addr(&mut buf[read_cnt..read_cnt + desc.len as usize], desc.addr)
-                .map_err(|_| VsockError::PacketAssemblyError)?;
-            read_cnt += desc.len as usize;
-            maybe_desc = desc.next_descriptor();
-        }
-
-        if read_cnt != (hdr.len as usize) {
-            info!("vsock: malformed TX packet, vring data != hdr.len");
-            return Err(VsockError::PacketAssemblyError);
-        }
-
-        Ok(VsockPacket { hdr, buf })
+        Ok(hdr)
     }
 
-    pub fn write_to_virtq_head(&self, head: &DescriptorChain, mem: &GuestMemory) -> Result<usize> {
-
-        if (head.len as usize) < VSOCK_PKT_HDR_SIZE {
-            return Err(VsockError::GeneralError);
+    pub fn write_to_virtq_desc(&self, desc: &DescriptorChain) -> Result<usize> {
+        if !desc.is_write_only() {
+            return Err(VsockError::UnwritableDescriptor);
+        }
+        if (desc.len as usize) < Self::SIZE {
+            return Err(VsockError::HdrDescTooSmall(desc.len));
         }
 
-        if !head.is_write_only() {
-            return Err(VsockError::GeneralError);
-        }
-
-        // TODO: return a more descriptive error
-        mem.write_slice_at_addr(
+        desc.mem.write_slice_at_addr(
             unsafe {
                 std::slice::from_raw_parts(
-                    &self.hdr as *const _ as *const u8,
-                    VSOCK_PKT_HDR_SIZE
+                    self as *const _ as *const u8,
+                    Self::SIZE
                 )
             },
-            head.addr
-        ).map_err(|_| VsockError::GeneralError)?;
+            desc.addr
+        ).map_err(VsockError::GuestMemory)
+    }
 
-        if self.hdr.len == 0 {
-            return Ok(VSOCK_PKT_HDR_SIZE);
+    pub fn with_len(mut self, len: u32) -> Self {
+        self.len = len;
+        self
+    }
+
+    pub fn with_flags(mut self, flags: u32) -> Self {
+        self.flags |= flags;
+        self
+    }
+
+}
+
+pub struct VsockPacketBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl VsockPacketBuf {
+
+    pub fn from_virtq_desc(desc: &DescriptorChain) -> Result<Self> {
+        desc.mem.checked_offset(desc.addr, desc.len as usize)
+            .ok_or(VsockError::GuestMemoryBounds)?;
+
+        Ok(Self::from_fat_ptr(
+            desc.mem.get_host_address(desc.addr).map_err(VsockError::GuestMemory)?,
+            desc.len as usize
+        ))
+    }
+
+    pub fn from_fat_ptr(ptr: *const u8, len: usize) -> Self {
+        Self {
+            ptr: ptr as *mut u8,
+            len
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self.ptr as *const u8,
+                self.len
+            )
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.ptr, self.len
+            )
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+
+pub struct VsockPacket {
+    pub hdr: VsockPacketHdr,
+    pub buf: Option<VsockPacketBuf>,
+}
+
+
+impl VsockPacket {
+
+    pub fn from_virtq_head(head: &DescriptorChain) -> Result<Self> {
+
+        let hdr = VsockPacketHdr::from_virtq_desc(head)?;
+        if (hdr.len as usize) > defs::MAX_PKT_BUF_SIZE {
+            return Err(VsockError::InvalidPktLen(hdr.len));
         }
 
-        let mut write_cnt = 0usize;
-        let mut maybe_desc = head.next_descriptor();
-        while let Some(desc) = maybe_desc {
-            if !desc.is_write_only() {
-                return Err(VsockError::GeneralError);
+        let maybe_buf = match head.next_descriptor() {
+            Some(buf_desc) => {
+                if buf_desc.is_write_only() {
+                    return Err(VsockError::UnreadableDescriptor);
+                }
+                if buf_desc.len < hdr.len {
+                    return Err(VsockError::BufDescTooSmall);
+                }
+                Some(VsockPacketBuf::from_virtq_desc(&buf_desc)?)
             }
-            let write_end = min(self.hdr.len as usize, write_cnt + desc.len as usize);
-            write_cnt += mem
-                .write_slice_at_addr(&self.buf[write_cnt..write_end], desc.addr)
-                .map_err(|_| VsockError::GeneralError)?;
-            maybe_desc = desc.next_descriptor();
-        }
+            None => None
+        };
 
-        // TODO: handle this error properly
-        if write_cnt < self.hdr.len as usize {
-            Err(VsockError::GeneralError)
-        }
-        else {
-            Ok(VSOCK_PKT_HDR_SIZE + write_cnt)
-        }
+        Ok(Self { hdr, buf: maybe_buf })
     }
 
 }

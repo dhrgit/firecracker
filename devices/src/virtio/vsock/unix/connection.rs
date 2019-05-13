@@ -7,8 +7,9 @@ use std::num::Wrapping;
 use std::os::unix::net::UnixStream;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use super::super::packet::{VsockPacket, VsockPacketHdr};
+use super::super::packet::{VsockPacket, VsockPacketHdr, VsockPacketBuf};
 use super::super::defs::uapi;
+use super::super::{VsockChannel, VsockEpollListener};
 use super::{Error, Result, VSOCK_TX_BUF_SIZE};
 
 
@@ -136,188 +137,8 @@ impl VsockConnection {
         }
     }
 
-    pub fn send_pkt(&mut self, pkt: VsockPacket) {
-
-        self.peer_buf_alloc = pkt.hdr.buf_alloc;
-        self.peer_fwd_cnt = Wrapping(pkt.hdr.fwd_cnt);
-
-        match self.state {
-
-            ConnState::Established | ConnState::PeerClosed(_, false)
-            if pkt.hdr.op == uapi::VSOCK_OP_RW => {
-                if let Err(err) = self.send_bytes(pkt.buf.as_slice()) {
-                    info!(
-                        "vsock: error writing to local stream (lp={}, pp={}): {:?}",
-                        self.local_port, self.peer_port, err
-                    );
-                    self.pending_rx.insert(PendingRx::Rst);
-                }
-                if self.peer_needs_credit_update() {
-                    self.pending_rx.insert(PendingRx::CreditUpdate);
-                }
-            },
-
-            ConnState::LocalInit if pkt.hdr.op == uapi::VSOCK_OP_RESPONSE => {
-                self.state = ConnState::Established;
-            },
-
-            ConnState::Established
-            if pkt.hdr.op == uapi::VSOCK_OP_SHUTDOWN => {
-                let recv_off = pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
-                let send_off = pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
-                self.state = ConnState::PeerClosed(recv_off, send_off);
-                if recv_off && send_off && self.tx_buf.len() == 0 {
-                    self.pending_rx.insert(PendingRx::Rst);
-                }
-            },
-
-            ConnState::PeerClosed(ref mut recv_off, ref mut send_off)
-            if pkt.hdr.op == uapi::VSOCK_OP_SHUTDOWN => {
-                *recv_off = *recv_off || (pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0);
-                *send_off = *send_off || (pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0);
-                if *recv_off && *send_off && self.tx_buf.len() == 0 {
-                    self.pending_rx.insert(PendingRx::Rst);
-                }
-            },
-
-            ConnState::Established | ConnState::PeerInit | ConnState::PeerClosed(false, _)
-            if pkt.hdr.op == uapi::VSOCK_OP_CREDIT_UPDATE => {
-                // Nothing to do here; we've already updated peer credit.
-            },
-
-            ConnState::Established | ConnState::PeerInit | ConnState::PeerClosed(_, false)
-            if pkt.hdr.op == uapi::VSOCK_OP_CREDIT_REQUEST => {
-                self.pending_rx.insert(PendingRx::CreditUpdate);
-            }
-
-            _ => {
-                debug!(
-                    "vsock: dropping invalid TX pkt for connection: state={:?}, pkt.hdr={:?}",
-                    self.state, pkt.hdr
-                );
-            }
-        };
-    }
-
-    pub fn recv_pkt(&mut self, mut max_len: usize) -> Option<VsockPacket> {
-
-        debug!(
-            "vsock: conn.recv_pkt, max_len={}, state={:?}, pending_rx={:04x}",
-            max_len, self.state, self.pending_rx.data
-        );
-        if self.pending_rx.remove(PendingRx::Rst) {
-            return Some(self.new_pkt_for_peer(uapi::VSOCK_OP_RST, 0, None));
-        }
-
-        if self.pending_rx.remove(PendingRx::Response) {
-            self.state = ConnState::Established;
-            return Some(self.new_pkt_for_peer(uapi::VSOCK_OP_RESPONSE, 0, None));
-        }
-
-        if self.pending_rx.remove(PendingRx::Request) {
-            return Some(self.new_pkt_for_peer(uapi::VSOCK_OP_REQUEST, 0, None));
-        }
-
-        if self.pending_rx.remove(PendingRx::CreditUpdate) && !self.has_pending_rx() {
-            return Some(self.new_pkt_for_peer(uapi::VSOCK_OP_CREDIT_UPDATE, 0, None));
-        }
-
-        self.pending_rx.remove(PendingRx::Rw);
-
-        match self.state {
-            ConnState::Established | ConnState::PeerClosed(false, _) => (),
-            _ => {
-                return Some(self.new_pkt_for_peer(uapi::VSOCK_OP_RST, 0, None));
-            }
-        }
-
-        if self.need_credit_update_from_peer() {
-            self.last_fwd_cnt_to_peer = self.fwd_cnt;
-            return Some(self.new_pkt_for_peer(uapi::VSOCK_OP_CREDIT_REQUEST, 0, None));
-        }
-
-        // `max_len` only tells us how much space the driver has made available in an RX buffer.
-        // We also need to consider how much credit the peer has left for this stream.
-        max_len = std::cmp::min(max_len, self.peer_avail_credit());
-
-        // Beyond this point, we'll need to produce a data packet. No point in trying that
-        // if there's no buffer to store the data into.
-        //
-        if max_len == 0 {
-            return None;
-        }
-
-        let mut buf: Vec<u8> = Vec::with_capacity(max_len);
-        buf.resize(max_len, 0);
-
-        let pkt = match self.stream.read(buf.as_mut_slice()) {
-            Ok(read_cnt) => {
-                if read_cnt == 0 {
-                    self.state = ConnState::LocalClosed;
-                    self.new_pkt_for_peer(
-                        uapi::VSOCK_OP_SHUTDOWN,
-                        uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
-                        None
-                    )
-                }
-                else {
-                    buf.resize(read_cnt, 0);
-                    self.new_pkt_for_peer(uapi::VSOCK_OP_RW, 0, Some(buf))
-                }
-            },
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    return None;
-                }
-                self.new_pkt_for_peer(uapi::VSOCK_OP_RST, 0, None)
-            }
-        };
-
-        self.rx_cnt += Wrapping(pkt.hdr.len);
-        self.last_fwd_cnt_to_peer = self.fwd_cnt;
-        Some(pkt)
-    }
-
     pub fn has_pending_rx(&self) -> bool {
         !self.pending_rx.is_empty()
-    }
-
-    pub fn as_raw_fd(&self) -> RawFd {
-        self.stream.as_raw_fd()
-    }
-
-    pub fn get_polled_evset(&self) -> epoll::Events {
-        let mut evset = epoll::Events::empty();
-        if self.tx_buf.len() > 0 {
-            evset.insert(epoll::Events::EPOLLOUT);
-        }
-        match self.state {
-            ConnState::LocalClosed | ConnState::PeerClosed(true, _) => (),
-            _ if self.need_credit_update_from_peer() => (),
-            _ => evset.insert(epoll::Events::EPOLLIN),
-        }
-        evset
-    }
-
-    pub fn get_polled_fd(&self) -> RawFd {
-        self.stream.as_raw_fd()
-    }
-
-    pub fn notify(&mut self, evset: epoll::Events) {
-        if evset.contains(epoll::Events::EPOLLIN) {
-            self.pending_rx.insert(PendingRx::Rw);
-        }
-        if evset.contains(epoll::Events::EPOLLOUT) {
-            self.flush_tx_buf()
-                .unwrap_or_else(|err| {
-                    info!(
-                        "vsock: error flushing TX buf for (lp={}, pp={}): {:?}",
-                        self.local_port, self.peer_port, err
-                    );
-                    self.pending_rx.insert(PendingRx::Rst);
-                    false
-                });
-        }
     }
 
     // true -> tx buf empty
@@ -390,23 +211,27 @@ impl VsockConnection {
         self.peer_avail_credit() == 0
     }
 
-    fn new_pkt_for_peer(&self, op: u16, flags: u32, buf: Option<Vec<u8>>) -> VsockPacket {
+    fn make_pkt(&self, op: u16, flags: u32, len: u32, buf: Option<VsockPacketBuf>) -> VsockPacket {
         VsockPacket {
             hdr: VsockPacketHdr {
                 src_cid: uapi::VSOCK_HOST_CID,
                 dst_cid: self.peer_cid,
                 src_port: self.local_port,
                 dst_port: self.peer_port,
-                len: if let Some(ref b) = buf { b.len() as u32 } else { 0 },
+                len,
                 type_: uapi::VSOCK_TYPE_STREAM,
                 op,
                 flags,
                 buf_alloc: self.buf_alloc,
                 fwd_cnt: self.fwd_cnt.0,
-                _pad: 0,
+                .. Default::default()
             },
-            buf: buf.unwrap_or(Vec::new()),
+            buf
         }
+    }
+
+    fn make_ctl_pkt(&self, op: u16) -> VsockPacket {
+        self.make_pkt(op, 0, 0, None)
     }
 
     fn peer_avail_credit(&self) -> usize {
@@ -423,3 +248,195 @@ impl VsockConnection {
 
 }
 
+impl VsockChannel for VsockConnection {
+
+    fn recv_pkt(&mut self, mut buf: VsockPacketBuf) -> Option<VsockPacket> {
+
+        if self.pending_rx.remove(PendingRx::Rst) {
+            return Some(self.make_ctl_pkt(uapi::VSOCK_OP_RST));
+        }
+
+        if self.pending_rx.remove(PendingRx::Response) {
+            self.state = ConnState::Established;
+            return Some(self.make_ctl_pkt(uapi::VSOCK_OP_RESPONSE));
+        }
+
+        if self.pending_rx.remove(PendingRx::Request) {
+            return Some(self.make_ctl_pkt(uapi::VSOCK_OP_REQUEST));
+        }
+
+        if self.pending_rx.remove(PendingRx::CreditUpdate) && !self.has_pending_rx() {
+            return Some(self.make_ctl_pkt(uapi::VSOCK_OP_CREDIT_UPDATE));
+        }
+
+        self.pending_rx.remove(PendingRx::Rw);
+
+        match self.state {
+            ConnState::Established | ConnState::PeerClosed(false, _) => (),
+            _ => {
+                return Some(self.make_ctl_pkt(uapi::VSOCK_OP_RST));
+            }
+        }
+
+        if self.need_credit_update_from_peer() {
+            self.last_fwd_cnt_to_peer = self.fwd_cnt;
+            return Some(self.make_ctl_pkt(uapi::VSOCK_OP_CREDIT_REQUEST));
+        }
+
+        // `max_len` only tells us how much space the driver has made available in an RX buffer.
+        // We also need to consider how much credit the peer has left for this stream.
+        let max_len = std::cmp::min(buf.len(), self.peer_avail_credit());
+
+        // Beyond this point, we'll need to produce a data packet. No point in trying that
+        // if there's no buffer to store the data into.
+        //
+        if max_len == 0 {
+            return None;
+        }
+
+        let pkt = match self.stream.read(&mut buf.as_mut_slice()[..max_len]) {
+            Ok(read_cnt) => {
+                if read_cnt == 0 {
+                    self.state = ConnState::LocalClosed;
+                    self.make_pkt(
+                        uapi::VSOCK_OP_SHUTDOWN,
+                        uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
+                        0,
+                        None
+                    )
+                }
+                else {
+                    self.make_pkt(
+                        uapi::VSOCK_OP_RW,
+                        0,
+                        read_cnt as u32,
+                        Some(buf)
+                    )
+                }
+            },
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    return None;
+                }
+                self.make_ctl_pkt(uapi::VSOCK_OP_RST)
+            }
+        };
+
+        self.rx_cnt += Wrapping(pkt.hdr.len);
+        self.last_fwd_cnt_to_peer = self.fwd_cnt;
+        Some(pkt)
+    }
+
+
+    fn send_pkt(&mut self, pkt: &VsockPacket) -> bool {
+
+        self.peer_buf_alloc = pkt.hdr.buf_alloc;
+        self.peer_fwd_cnt = Wrapping(pkt.hdr.fwd_cnt);
+
+        match self.state {
+
+            ConnState::Established | ConnState::PeerClosed(_, false)
+            if pkt.hdr.op == uapi::VSOCK_OP_RW => {
+                if pkt.buf.is_none() {
+                    info!(
+                        "vsock: dropping empty data packet from guest (lp={}, pp={}",
+                        self.local_port, self.peer_port
+                    );
+                    return true;
+                }
+                let buf_slice = &pkt.buf.as_ref().unwrap().as_slice()[..(pkt.hdr.len as usize)];
+                if let Err(err) = self.send_bytes(buf_slice) {
+                    info!(
+                        "vsock: error writing to local stream (lp={}, pp={}): {:?}",
+                        self.local_port, self.peer_port, err
+                    );
+                    self.pending_rx.insert(PendingRx::Rst);
+                }
+                if self.peer_needs_credit_update() {
+                    self.pending_rx.insert(PendingRx::CreditUpdate);
+                }
+            },
+
+            ConnState::LocalInit if pkt.hdr.op == uapi::VSOCK_OP_RESPONSE => {
+                self.state = ConnState::Established;
+            },
+
+            ConnState::Established
+            if pkt.hdr.op == uapi::VSOCK_OP_SHUTDOWN => {
+                let recv_off = pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
+                let send_off = pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
+                self.state = ConnState::PeerClosed(recv_off, send_off);
+                if recv_off && send_off && self.tx_buf.len() == 0 {
+                    self.pending_rx.insert(PendingRx::Rst);
+                }
+            },
+
+            ConnState::PeerClosed(ref mut recv_off, ref mut send_off)
+            if pkt.hdr.op == uapi::VSOCK_OP_SHUTDOWN => {
+                *recv_off = *recv_off || (pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0);
+                *send_off = *send_off || (pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0);
+                if *recv_off && *send_off && self.tx_buf.len() == 0 {
+                    self.pending_rx.insert(PendingRx::Rst);
+                }
+            },
+
+            ConnState::Established | ConnState::PeerInit | ConnState::PeerClosed(false, _)
+            if pkt.hdr.op == uapi::VSOCK_OP_CREDIT_UPDATE => {
+                // Nothing to do here; we've already updated peer credit.
+            },
+
+            ConnState::Established | ConnState::PeerInit | ConnState::PeerClosed(_, false)
+            if pkt.hdr.op == uapi::VSOCK_OP_CREDIT_REQUEST => {
+                self.pending_rx.insert(PendingRx::CreditUpdate);
+            }
+
+            _ => {
+                debug!(
+                    "vsock: dropping invalid TX pkt for connection: state={:?}, pkt.hdr={:?}",
+                    self.state, pkt.hdr
+                );
+            }
+        };
+
+        true
+    }
+
+}
+
+impl VsockEpollListener for VsockConnection {
+
+    fn get_polled_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+
+    fn get_polled_evset(&self) -> epoll::Events {
+        let mut evset = epoll::Events::empty();
+        if self.tx_buf.len() > 0 {
+            evset.insert(epoll::Events::EPOLLOUT);
+        }
+        match self.state {
+            ConnState::LocalClosed | ConnState::PeerClosed(true, _) => (),
+            _ if self.need_credit_update_from_peer() => (),
+            _ => evset.insert(epoll::Events::EPOLLIN),
+        }
+        evset
+    }
+
+    fn notify(&mut self, evset: epoll::Events) {
+        if evset.contains(epoll::Events::EPOLLIN) {
+            self.pending_rx.insert(PendingRx::Rw);
+        }
+        if evset.contains(epoll::Events::EPOLLOUT) {
+            self.flush_tx_buf()
+                .unwrap_or_else(|err| {
+                    info!(
+                        "vsock: error flushing TX buf for (lp={}, pp={}): {:?}",
+                        self.local_port, self.peer_port, err
+                    );
+                    self.pending_rx.insert(PendingRx::Rst);
+                    false
+                });
+        }
+    }
+
+}

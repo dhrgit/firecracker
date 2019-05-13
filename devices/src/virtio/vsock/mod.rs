@@ -16,12 +16,14 @@ pub use self::defs::EVENT_COUNT as VSOCK_EVENTS_COUNT;
 use std::sync::mpsc;
 use std::os::unix::io::{RawFd};
 
+use memory_model::GuestMemoryError;
+
 use super::super::EpollHandler;
-use self::packet::VsockPacket;
+use self::packet::{VsockPacket, VsockPacketBuf};
 
 
 mod defs {
-    use super::super::super::DeviceEventT;
+    use crate::DeviceEventT;
 
     /// RX queue event: the driver added available buffers to the RX queue.
     pub const RXQ_EVENT: DeviceEventT = 0;
@@ -39,7 +41,7 @@ mod defs {
     pub const QUEUE_SIZES: &'static [u16] = &[QUEUE_SIZE; NUM_QUEUES];
 
     /// Max vsock packet data/buffer size.
-    pub const MAX_PKT_BUF_SIZE: usize = 512 * 1024;
+    pub const MAX_PKT_BUF_SIZE: usize = 64 * 1024;
 
     pub mod uapi {
         use virtio_gen::virtio_vsock as gen;
@@ -69,8 +71,15 @@ mod defs {
 
 #[derive(Debug)]
 pub enum VsockError {
-    PacketAssemblyError,
+    BufDescTooSmall,
+    DescriptorChainTooShort,
+    HdrDescTooSmall(u32),
+    InvalidPktLen(u32),
+    UnreadableDescriptor,
+    UnwritableDescriptor,
     GeneralError,
+    GuestMemory(GuestMemoryError),
+    GuestMemoryBounds,
 
     IoError(std::io::Error),
 
@@ -106,10 +115,16 @@ impl EpollConfig {
     }
 }
 
-pub trait VsockBackend : Send {
-    fn get_epoll_listener(&self) -> (RawFd, epoll::Events);
+pub trait VsockEpollListener {
+    fn get_polled_fd(&self) -> RawFd;
+    fn get_polled_evset(&self) -> epoll::Events;
     fn notify(&mut self, evset: epoll::Events);
-    fn send_pkt(&mut self, pkt: VsockPacket) -> bool;
-    fn recv_pkt(&mut self, max_len: usize) -> Option<VsockPacket>;
 }
+
+pub trait VsockChannel {
+    fn recv_pkt(&mut self, pkt: VsockPacketBuf) -> Option<VsockPacket>;
+    fn send_pkt(&mut self, pkt: &VsockPacket) -> bool;
+}
+
+pub trait VsockBackend : VsockChannel + VsockEpollListener + Send {}
 

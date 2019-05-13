@@ -13,7 +13,7 @@ use super::super::super::{DeviceEventT, Error as DeviceError};
 use super::super::queue::Queue as VirtQueue;
 use super::super::{EpollHandlerPayload, VIRTIO_MMIO_INT_VRING};
 use super::{EpollHandler, VsockBackend};
-use super::packet::VsockPacket;
+use super::packet::{VsockPacket, VsockPacketBuf};
 use super::defs;
 
 
@@ -48,30 +48,28 @@ impl<B> VsockEpollHandler<B> where B: VsockBackend {
 
         let mut raise_irq = false;
 
+        // TODO: rewrite this; it's ugly.
+
         while let Some(head) = self.rxvq.iter(&self.mem).next() {
-            let mut max_len = 0usize;
 
-            let mut maybe_desc = head.next_descriptor();
-            while let Some(desc) = maybe_desc {
-                max_len += desc.len as usize;
-                maybe_desc = desc.next_descriptor();
-            }
+            let mut used_len = 0;
 
-            if let Some(pkt) = self.backend.recv_pkt(max_len) {
-                let len = match pkt.write_to_virtq_head(&head, &self.mem) {
-                    Err(e) => {
-                        warn!("vsock: error writing pkt to guest mem: {:?}", e);
+            if let Some(buf_desc) = head.next_descriptor() {
+                // TODO: check buf_desc.is_write_only()
+                if let Ok(pkt_buf) = VsockPacketBuf::from_virtq_desc(&buf_desc) {
+                    if let Some(pkt) = self.backend.recv_pkt(pkt_buf) {
+                        if let Ok(hdr_size) = pkt.hdr.write_to_virtq_desc(&head) {
+                            used_len = (hdr_size as u32) + pkt.hdr.len;
+                        }
+                    }
+                    else {
                         self.rxvq.go_to_previous_position();
                         break;
                     }
-                    Ok(len) => len,
-                };
-                raise_irq = true;
-                self.rxvq.add_used(&self.mem, head.index, len as u32);
-            } else {
-                self.rxvq.go_to_previous_position();
-                break;
+                }
             }
+            raise_irq = true;
+            self.rxvq.add_used(&self.mem, head.index, used_len);
         }
 
         if raise_irq {
@@ -86,7 +84,7 @@ impl<B> VsockEpollHandler<B> where B: VsockBackend {
         let mut raise_irq = false;
 
         while let Some(head) = self.txvq.iter(&self.mem).next() {
-            let pkt = match VsockPacket::from_virtq_head(&head, &self.mem) {
+            let pkt = match VsockPacket::from_virtq_head(&head) {
                 Ok(pkt) => pkt,
                 Err(e) => {
                     error!("vsock: error reading TX packet: {:?}", e);
@@ -96,7 +94,7 @@ impl<B> VsockEpollHandler<B> where B: VsockBackend {
                 }
             };
 
-            if self.backend.send_pkt(pkt) != true {
+            if self.backend.send_pkt(&pkt) != true {
                 self.txvq.go_to_previous_position();
                 break;
             }
@@ -116,12 +114,12 @@ impl<B> EpollHandler for VsockEpollHandler<B> where B: VsockBackend {
     fn handle_event(
         &mut self,
         device_event: DeviceEventT,
-        evmask: u32,
+        evset_bits: u32,
         _payload: EpollHandlerPayload,
     ) -> result::Result<(), DeviceError> {
         match device_event {
             defs::RXQ_EVENT => {
-                info!("vsock RX q event");
+                debug!("vsock: RX queue event");
                 if let Err(e) = self.rxvq_evt.read() {
                     error!("Failed to get rx queue event: {:?}", e);
                     return Err(DeviceError::FailedReadingQueue {
@@ -133,7 +131,7 @@ impl<B> EpollHandler for VsockEpollHandler<B> where B: VsockBackend {
                 }
             }
             defs::TXQ_EVENT => {
-                info!("vsock TX q event");
+                debug!("vsock: TX queue event");
                 if let Err(e) = self.txvq_evt.read() {
                     error!("Failed to get tx queue event: {:?}", e);
                     return Err(DeviceError::FailedReadingQueue {
@@ -146,7 +144,7 @@ impl<B> EpollHandler for VsockEpollHandler<B> where B: VsockBackend {
                 }
             }
             defs::EVQ_EVENT => {
-                warn!("Event queue unimplemented");
+                debug!("vsock: event queue event");
                 if let Err(e) = self.evq_evt.read() {
                     error!("Failed to consume evq event: {:?}", e);
                     return Err(DeviceError::FailedReadingQueue {
@@ -156,17 +154,17 @@ impl<B> EpollHandler for VsockEpollHandler<B> where B: VsockBackend {
                 }
             }
             defs::BACKEND_EVENT => {
-                debug!("vsock: received backend event");
-                if let Some(evset) = epoll::Events::from_bits(evmask) {
+                debug!("vsock: backend event");
+                if let Some(evset) = epoll::Events::from_bits(evset_bits) {
                     self.backend.notify(evset);
+                    // This event may have caused some packets to be queued up by the backend.
+                    // Make sure they are processed.
+                    self.process_rx();
                 }
                 else {
-                    error!("vsock: invalid backend event, evmask={}", evmask);
+                    warn!("vsock: unexpected backend event flags={:08x}", evset_bits);
                 }
 
-                // This event may have caused some packets to be queued up by the backend.
-                // Make sure they are processed.
-                self.process_rx();
             }
             other => {
                 return Err(DeviceError::UnknownEvent {
@@ -180,93 +178,3 @@ impl<B> EpollHandler for VsockEpollHandler<B> where B: VsockBackend {
     }
 }
 
-#[cfg(test)]
-mod tests {
-
-    use std::collections::VecDeque;
-    use super::super::Result;
-    use super::super::defs::uapi;
-    use super::super::packet::VsockPacket;
-
-
-    pub struct DummyMuxer {
-        pub rxq: VecDeque<VsockPacket>,
-        fwd_cnt: usize,
-        credit_update_counter: usize,
-    }
-
-    impl DummyMuxer {
-        pub fn new() -> Self {
-            Self {
-                rxq: VecDeque::new(),
-                fwd_cnt: 0,
-                credit_update_counter: 0,
-            }
-        }
-
-        fn send(&mut self, pkt: VsockPacket) -> Result<()> {
-
-            self.fwd_cnt += pkt.hdr.len as usize;
-
-            debug!("mock TX (rxq={}): op={}, len={}, ba={}, fc={}",
-                   self.rxq.len(),
-                   pkt.hdr.op,
-                   pkt.hdr.len,
-                   pkt.hdr.buf_alloc,
-                   pkt.hdr.fwd_cnt,
-            );
-
-            let mut re_pkt = VsockPacket::new_response(
-                pkt.hdr.dst_cid,
-                pkt.hdr.src_cid,
-                pkt.hdr.dst_port,
-                pkt.hdr.src_port
-            );
-
-            re_pkt.hdr.buf_alloc = 256*1024;
-            re_pkt.hdr.fwd_cnt = self.fwd_cnt as u32;
-
-            match pkt.hdr.op {
-                uapi::VSOCK_OP_REQUEST => {
-                    self.rxq.push_back(re_pkt);
-                },
-                uapi::VSOCK_OP_RW => {
-                    self.credit_update_counter += 1;
-                    if self.credit_update_counter > 15 {
-                        self.credit_update_counter = 0;
-                        re_pkt.hdr.op = uapi::VSOCK_OP_CREDIT_UPDATE;
-                        self.rxq.push_back(re_pkt);
-                    }
-                },
-                uapi::VSOCK_OP_CREDIT_REQUEST => {
-                    re_pkt.hdr.op = uapi::VSOCK_OP_CREDIT_UPDATE;
-                    self.rxq.push_back(re_pkt);
-                },
-                uapi::VSOCK_OP_SHUTDOWN => {
-                    re_pkt.hdr.op = uapi::VSOCK_OP_RST;
-                    self.rxq.push_back(re_pkt);
-                },
-                _ => {
-                    debug!("mock: unexpected TX pkt: op={} len={}", pkt.hdr.op, pkt.hdr.len);
-                }
-            }
-            Ok(())
-        }
-
-        fn recv(&mut self, max_len: usize) -> Option<VsockPacket> {
-            let mp = self.rxq.pop_front();
-            match mp {
-                Some(ref p) => debug!(
-                    "mock RX (rxq={}): op={} len={} ba={} fc={}",
-                    self.rxq.len(), p.hdr.op, p.hdr.len, p.hdr.buf_alloc, p.hdr.fwd_cnt
-                ),
-                None => debug!("mock RX (empty)"),
-            }
-            mp
-        }
-
-        fn kick(&self) {
-            debug!("mock kick");
-        }
-    }
-}

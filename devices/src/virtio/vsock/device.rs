@@ -228,3 +228,106 @@ impl VirtioDevice for Vsock {
     }
 }
 
+#[cfg(test)]
+mod tests {
+
+    use std::collections::VecDeque;
+    use std::fs::File;
+    use std::num::Wrapping;
+    use std::io::Write;
+
+    use super::*;
+    use crate::virtio::vsock::{VsockChannel, VsockEpollListener, VsockBackend};
+    use crate::virtio::vsock::packet::{VsockPacket, VsockPacketBuf, VsockPacketHdr};
+
+    pub struct DummyBackend {
+        sink: File,
+        rxq: VecDeque<VsockPacketHdr>,
+        fwd_cnt: Wrapping<u32>,
+    }
+
+    impl DummyBackend {
+        pub fn new() -> Self {
+            Self {
+                sink: File::create("/dev/null").unwrap(),
+                rxq: VecDeque::new(),
+                fwd_cnt: Wrapping(0),
+            }
+        }
+    }
+
+    impl VsockEpollListener for DummyBackend {
+        fn get_polled_fd(&self) -> RawFd {
+            -1 as RawFd
+        }
+        fn get_polled_evset(&self) -> epoll::Events {
+            epoll::Events::empty()
+        }
+        fn notify(&mut self, evset: epoll::Events) {}
+    }
+
+    impl VsockChannel for DummyBackend {
+        fn recv_pkt(&mut self, buf: VsockPacketBuf) -> Option<VsockPacket> {
+            self.rxq.pop_front()
+                .map(|hdr| {
+                    VsockPacket { hdr, buf: None }
+                })
+        }
+        fn send_pkt(&mut self, pkt: &VsockPacket) -> bool {
+            debug!("dummy muxer send pkt: {:?}", pkt.hdr);
+            match pkt.hdr.op {
+                uapi::VSOCK_OP_REQUEST => {
+                    self.rxq.push_back(
+                        VsockPacketHdr {
+                            src_cid: pkt.hdr.dst_cid,
+                            dst_cid: pkt.hdr.src_cid,
+                            src_port: pkt.hdr.dst_port,
+                            dst_port: pkt.hdr.src_port,
+                            op: uapi::VSOCK_OP_RESPONSE,
+                            type_: uapi::VSOCK_TYPE_STREAM,
+                            buf_alloc: 256 * 1024,
+                            fwd_cnt: self.fwd_cnt.0,
+                            .. Default::default()
+                        }
+                    );
+                },
+                uapi::VSOCK_OP_RW => {
+                    if let Some(buf) = pkt.buf.as_ref() {
+                        self.sink.write(&buf.as_slice()[..pkt.hdr.len as usize]).unwrap();
+                        self.fwd_cnt += Wrapping(pkt.hdr.len);
+                        self.rxq.push_back(VsockPacketHdr {
+                                src_cid: pkt.hdr.dst_cid,
+                                dst_cid: pkt.hdr.src_cid,
+                                src_port: pkt.hdr.dst_port,
+                                dst_port: pkt.hdr.src_port,
+                                op: uapi::VSOCK_OP_CREDIT_UPDATE,
+                                type_: uapi::VSOCK_TYPE_STREAM,
+                                buf_alloc: 256 * 1024,
+                                fwd_cnt: self.fwd_cnt.0,
+                                .. Default::default()
+                        });
+                    }
+                },
+                uapi::VSOCK_OP_SHUTDOWN => {
+                    self.rxq.push_back(VsockPacketHdr {
+                        src_cid: pkt.hdr.dst_cid,
+                        dst_cid: pkt.hdr.src_cid,
+                        src_port: pkt.hdr.dst_port,
+                        dst_port: pkt.hdr.src_port,
+                        op: uapi::VSOCK_OP_RST,
+                        type_: uapi::VSOCK_TYPE_STREAM,
+                        buf_alloc: 256 * 1024,
+                        fwd_cnt: self.fwd_cnt.0,
+                        .. Default::default()
+                    });
+                },
+                _ => ()
+            }
+            true
+        }
+    }
+
+    impl VsockBackend for DummyBackend {}
+
+}
+
