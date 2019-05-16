@@ -211,27 +211,24 @@ impl VsockConnection {
         self.peer_avail_credit() == 0
     }
 
-    fn make_pkt(&self, op: u16, flags: u32, len: u32, buf: Option<VsockPacketBuf>) -> VsockPacket {
-        VsockPacket {
-            hdr: VsockPacketHdr {
-                src_cid: uapi::VSOCK_HOST_CID,
-                dst_cid: self.peer_cid,
-                src_port: self.local_port,
-                dst_port: self.peer_port,
-                len,
-                type_: uapi::VSOCK_TYPE_STREAM,
-                op,
-                flags,
-                buf_alloc: self.buf_alloc,
-                fwd_cnt: self.fwd_cnt.0,
-                .. Default::default()
-            },
-            buf
+    fn make_pkt_hdr(&self, op: u16, flags: u32, len: u32) -> VsockPacketHdr {
+        VsockPacketHdr {
+            src_cid: uapi::VSOCK_HOST_CID,
+            dst_cid: self.peer_cid,
+            src_port: self.local_port,
+            dst_port: self.peer_port,
+            len,
+            type_: uapi::VSOCK_TYPE_STREAM,
+            op,
+            flags,
+            buf_alloc: self.buf_alloc,
+            fwd_cnt: self.fwd_cnt.0,
+            .. Default::default()
         }
     }
 
-    fn make_ctl_pkt(&self, op: u16) -> VsockPacket {
-        self.make_pkt(op, 0, 0, None)
+    fn make_ctl_pkt_hdr(&self, op: u16) -> VsockPacketHdr {
+        self.make_pkt_hdr(op, 0, 0)
     }
 
     fn peer_avail_credit(&self) -> usize {
@@ -250,23 +247,23 @@ impl VsockConnection {
 
 impl VsockChannel for VsockConnection {
 
-    fn recv_pkt(&mut self, mut buf: VsockPacketBuf) -> Option<VsockPacket> {
+    fn recv_pkt(&mut self, buf: &mut VsockPacketBuf) -> Option<VsockPacketHdr> {
 
         if self.pending_rx.remove(PendingRx::Rst) {
-            return Some(self.make_ctl_pkt(uapi::VSOCK_OP_RST));
+            return Some(self.make_ctl_pkt_hdr(uapi::VSOCK_OP_RST));
         }
 
         if self.pending_rx.remove(PendingRx::Response) {
             self.state = ConnState::Established;
-            return Some(self.make_ctl_pkt(uapi::VSOCK_OP_RESPONSE));
+            return Some(self.make_ctl_pkt_hdr(uapi::VSOCK_OP_RESPONSE));
         }
 
         if self.pending_rx.remove(PendingRx::Request) {
-            return Some(self.make_ctl_pkt(uapi::VSOCK_OP_REQUEST));
+            return Some(self.make_ctl_pkt_hdr(uapi::VSOCK_OP_REQUEST));
         }
 
         if self.pending_rx.remove(PendingRx::CreditUpdate) && !self.has_pending_rx() {
-            return Some(self.make_ctl_pkt(uapi::VSOCK_OP_CREDIT_UPDATE));
+            return Some(self.make_ctl_pkt_hdr(uapi::VSOCK_OP_CREDIT_UPDATE));
         }
 
         self.pending_rx.remove(PendingRx::Rw);
@@ -274,13 +271,13 @@ impl VsockChannel for VsockConnection {
         match self.state {
             ConnState::Established | ConnState::PeerClosed(false, _) => (),
             _ => {
-                return Some(self.make_ctl_pkt(uapi::VSOCK_OP_RST));
+                return Some(self.make_ctl_pkt_hdr(uapi::VSOCK_OP_RST));
             }
         }
 
         if self.need_credit_update_from_peer() {
             self.last_fwd_cnt_to_peer = self.fwd_cnt;
-            return Some(self.make_ctl_pkt(uapi::VSOCK_OP_CREDIT_REQUEST));
+            return Some(self.make_ctl_pkt_hdr(uapi::VSOCK_OP_CREDIT_REQUEST));
         }
 
         // `max_len` only tells us how much space the driver has made available in an RX buffer.
@@ -294,23 +291,21 @@ impl VsockChannel for VsockConnection {
             return None;
         }
 
-        let pkt = match self.stream.read(&mut buf.as_mut_slice()[..max_len]) {
+        let pkt_hdr = match self.stream.read(&mut buf.as_mut_slice()[..max_len]) {
             Ok(read_cnt) => {
                 if read_cnt == 0 {
                     self.state = ConnState::LocalClosed;
-                    self.make_pkt(
+                    self.make_pkt_hdr(
                         uapi::VSOCK_OP_SHUTDOWN,
                         uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
                         0,
-                        None
                     )
                 }
                 else {
-                    self.make_pkt(
+                    self.make_pkt_hdr(
                         uapi::VSOCK_OP_RW,
                         0,
                         read_cnt as u32,
-                        Some(buf)
                     )
                 }
             },
@@ -318,13 +313,13 @@ impl VsockChannel for VsockConnection {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
                     return None;
                 }
-                self.make_ctl_pkt(uapi::VSOCK_OP_RST)
+                self.make_ctl_pkt_hdr(uapi::VSOCK_OP_RST)
             }
         };
 
-        self.rx_cnt += Wrapping(pkt.hdr.len);
+        self.rx_cnt += Wrapping(pkt_hdr.len);
         self.last_fwd_cnt_to_peer = self.fwd_cnt;
-        Some(pkt)
+        Some(pkt_hdr)
     }
 
 

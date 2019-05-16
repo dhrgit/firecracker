@@ -12,6 +12,7 @@ mod unix;
 
 pub use self::device::Vsock;
 pub use self::defs::EVENT_COUNT as VSOCK_EVENTS_COUNT;
+pub use self::unix::muxer::VsockMuxer as VsockUnixBackend;
 
 use std::sync::mpsc;
 use std::os::unix::io::{RawFd};
@@ -19,7 +20,7 @@ use std::os::unix::io::{RawFd};
 use memory_model::GuestMemoryError;
 
 use super::super::EpollHandler;
-use self::packet::{VsockPacket, VsockPacketBuf};
+use self::packet::{VsockPacket, VsockPacketBuf, VsockPacketHdr};
 
 
 mod defs {
@@ -80,11 +81,7 @@ pub enum VsockError {
     GeneralError,
     GuestMemory(GuestMemoryError),
     GuestMemoryBounds,
-
     IoError(std::io::Error),
-
-    // TODO: look into using some generic here, instead of collapsing the downstream error into a string
-    BackendError(String),
 }
 type Result<T> = std::result::Result<T, VsockError>;
 
@@ -122,7 +119,7 @@ pub trait VsockEpollListener {
 }
 
 pub trait VsockChannel {
-    fn recv_pkt(&mut self, pkt: VsockPacketBuf) -> Option<VsockPacket>;
+    fn recv_pkt(&mut self, buf: &mut VsockPacketBuf) -> Option<VsockPacketHdr>;
     fn send_pkt(&mut self, pkt: &VsockPacket) -> bool;
 }
 

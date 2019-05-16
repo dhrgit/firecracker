@@ -981,12 +981,17 @@ impl Vmm {
 
         for cfg in self.vsock_device_configs.iter() {
 
+            let backend = devices::virtio::vsock::VsockUnixBackend::new(
+                u64::from(cfg.guest_cid),
+                cfg.uds_path.clone(),
+            ).map_err(|_| StartMicrovmError::CreateVsockDevice)?;
+
             let epoll_config = self.epoll_context.allocate_virtio_vsock_tokens();
             let vsock_box = Box::new(
                 devices::virtio::Vsock::new(
                     u64::from(cfg.guest_cid),
-                    cfg.uds_path.clone(),
-                    epoll_config
+                    epoll_config,
+                    backend,
                 ).or(Err(StartMicrovmError::CreateVsockDevice))?,
             );
             device_manager

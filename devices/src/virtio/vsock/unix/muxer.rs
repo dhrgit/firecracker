@@ -57,12 +57,16 @@ impl VsockMuxer {
 
     pub fn new(
         cid: u64,
-        host_sock: UnixListener,
         host_sock_path: String,
-        epoll_fd: RawFd
     ) -> Result<Self> {
 
-        let host_sock_fd = host_sock.as_raw_fd();
+        let epoll_fd = epoll::create(true)
+            .map_err(Error::IoError)?;
+        let host_sock = UnixListener::bind(&host_sock_path)
+            .and_then(|sock| {
+                sock.set_nonblocking(true).map(|_| sock)
+            })
+            .map_err(Error::IoError)?;
 
         let mut muxer = Self {
             rxq: VecDeque::new(),
@@ -76,7 +80,7 @@ impl VsockMuxer {
             local_port_set: HashSet::new(),
         };
 
-        muxer.add_listener(host_sock_fd, EpollListener::HostSock)?;
+        muxer.add_listener(muxer.host_sock.as_raw_fd(), EpollListener::HostSock)?;
         Ok(muxer)
     }
 
@@ -387,57 +391,48 @@ impl VsockEpollListener for VsockMuxer {
 
 impl VsockChannel for VsockMuxer {
 
-    fn recv_pkt(&mut self, buf: VsockPacketBuf) -> Option<VsockPacket> {
+    fn recv_pkt(&mut self, buf: &mut VsockPacketBuf) -> Option<VsockPacketHdr> {
 
         debug!("vsock: muxer[rxq.len={}] recv_pkt()", self.rxq.len());
 
-        // TODO: if conn.recv_pkt returns None, try the next item in self.rxq
-        let maybe_pkt = match self.rxq.pop_front() {
-            Some(MuxerRx::RstPkt{local_port, peer_port}) => {
-                debug!("vsock muxer: rxq.pop() -> RstPkt");
-                Some(
-                    VsockPacket {
-                        hdr: VsockPacketHdr {
-                            src_cid: uapi::VSOCK_HOST_CID,
-                            dst_cid: self.cid,
-                            src_port: local_port,
-                            dst_port: peer_port,
-                            len: 0,
-                            type_: uapi::VSOCK_TYPE_STREAM,
-                            op: uapi::VSOCK_OP_RST,
-                            ..Default::default()
-                        },
-                        buf: None,
-                    }
-                )
-            },
-            Some(MuxerRx::ConnRx(key)) => {
-                debug!("vosck muxer: rxq.pop() -> ConnRx({:?})", key);
-                let mut maybe_conn_pkt: Option<VsockPacket> = None;
-                self.apply_conn_mutation(key, |conn| {
-                    maybe_conn_pkt = conn.recv_pkt(buf);
-                });
-                maybe_conn_pkt
-            },
-            None => None
-        };
+        while let Some(rx) = self.rxq.pop_front() {
 
-        // TODO: unregister all EPOLLIN, if the driver stops processing the RX q
+            let maybe_pkt_hdr = match rx {
+                MuxerRx::RstPkt{local_port, peer_port} => {
+                    Some(VsockPacketHdr {
+                        src_cid: uapi::VSOCK_HOST_CID,
+                        dst_cid: self.cid,
+                        src_port: local_port,
+                        dst_port: peer_port,
+                        len: 0,
+                        type_: uapi::VSOCK_TYPE_STREAM,
+                        op: uapi::VSOCK_OP_RST,
+                        ..Default::default()
+                    })
+                },
+                MuxerRx::ConnRx(key) => {
+                    let mut maybe_conn_pkt_hdr = None;
+                    self.apply_conn_mutation(key, |conn| {
+                        maybe_conn_pkt_hdr = conn.recv_pkt(buf);
+                    });
+                    maybe_conn_pkt_hdr
+                },
+            };
 
-        // Look for locally issued RSTs, in which case we need to remove the connection.
-        //
-        if let Some(ref pkt) = maybe_pkt {
-            if pkt.hdr.op == uapi::VSOCK_OP_RST {
-                self.remove_connection(ConnMapKey {
-                    local_port: pkt.hdr.src_port,
-                    peer_port: pkt.hdr.dst_port,
-                });
+            if let Some(ref pkt_hdr) = maybe_pkt_hdr {
+                if pkt_hdr.op == uapi::VSOCK_OP_RST {
+                    self.remove_connection(ConnMapKey {
+                        local_port: pkt_hdr.src_port,
+                        peer_port: pkt_hdr.dst_port,
+                    });
+                }
+
+                debug!("vsock muxer: RX pkt: {:?}", pkt_hdr);
+                return maybe_pkt_hdr;
             }
-
-            debug!("vsock muxer: RX pkt: {:?}", pkt.hdr);
         }
 
-        maybe_pkt
+        None
     }
 
     // TODO: is this return value right?

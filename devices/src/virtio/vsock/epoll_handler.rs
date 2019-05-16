@@ -56,10 +56,10 @@ impl<B> VsockEpollHandler<B> where B: VsockBackend {
 
             if let Some(buf_desc) = head.next_descriptor() {
                 // TODO: check buf_desc.is_write_only()
-                if let Ok(pkt_buf) = VsockPacketBuf::from_virtq_desc(&buf_desc) {
-                    if let Some(pkt) = self.backend.recv_pkt(pkt_buf) {
-                        if let Ok(hdr_size) = pkt.hdr.write_to_virtq_desc(&head) {
-                            used_len = (hdr_size as u32) + pkt.hdr.len;
+                if let Ok(mut pkt_buf) = VsockPacketBuf::from_virtq_desc(&buf_desc) {
+                    if let Some(pkt_hdr) = self.backend.recv_pkt(&mut pkt_buf) {
+                        if let Ok(hdr_size) = pkt_hdr.write_to_virtq_desc(&head) {
+                            used_len = (hdr_size as u32) + pkt_hdr.len;
                         }
                     }
                     else {
