@@ -9,8 +9,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::io::{RawFd, AsRawFd};
 
 use super::super::defs::uapi;
-use super::super::packet::{VsockPacket, VsockPacketBuf, VsockPacketHdr};
-use super::super::{VsockBackend, VsockChannel, VsockEpollListener};
+use super::super::packet::{VsockPacket};
+use super::super::{VsockBackend, VsockChannel, VsockEpollListener, VsockError, Result as VsockResult};
 use super::connection::VsockConnection;
 use super::{Error, Result};
 
@@ -391,53 +391,52 @@ impl VsockEpollListener for VsockMuxer {
 
 impl VsockChannel for VsockMuxer {
 
-    fn recv_pkt(&mut self, buf: &mut VsockPacketBuf) -> Option<VsockPacketHdr> {
+    fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> VsockResult<()> {
 
         debug!("vsock: muxer[rxq.len={}] recv_pkt()", self.rxq.len());
 
         while let Some(rx) = self.rxq.pop_front() {
 
-            let maybe_pkt_hdr = match rx {
+            let res = match rx {
                 MuxerRx::RstPkt{local_port, peer_port} => {
-                    Some(VsockPacketHdr {
-                        src_cid: uapi::VSOCK_HOST_CID,
-                        dst_cid: self.cid,
-                        src_port: local_port,
-                        dst_port: peer_port,
-                        len: 0,
-                        type_: uapi::VSOCK_TYPE_STREAM,
-                        op: uapi::VSOCK_OP_RST,
-                        ..Default::default()
-                    })
+                    pkt.hdr.op = uapi::VSOCK_OP_RST;
+                    pkt.hdr.src_cid = uapi::VSOCK_HOST_CID;
+                    pkt.hdr.dst_cid = self.cid;
+                    pkt.hdr.src_port = local_port;
+                    pkt.hdr.dst_port = peer_port;
+                    pkt.hdr.len = 0;
+                    pkt.hdr.type_ = uapi::VSOCK_TYPE_STREAM;
+                    pkt.hdr.flags = 0;
+                    pkt.hdr.buf_alloc = 0;
+                    pkt.hdr.fwd_cnt = 0;
+                    Ok(())
                 },
                 MuxerRx::ConnRx(key) => {
-                    let mut maybe_conn_pkt_hdr = None;
+                    let mut conn_res = Err(VsockError::NoData);
                     self.apply_conn_mutation(key, |conn| {
-                        maybe_conn_pkt_hdr = conn.recv_pkt(buf);
+                        conn_res = conn.recv_pkt(pkt);
                     });
-                    maybe_conn_pkt_hdr
+                    conn_res
                 },
             };
 
-            if let Some(ref pkt_hdr) = maybe_pkt_hdr {
-                if pkt_hdr.op == uapi::VSOCK_OP_RST {
+            if res.is_ok() {
+                if pkt.hdr.op == uapi::VSOCK_OP_RST {
                     self.remove_connection(ConnMapKey {
-                        local_port: pkt_hdr.src_port,
-                        peer_port: pkt_hdr.dst_port,
+                        local_port: pkt.hdr.src_port,
+                        peer_port: pkt.hdr.dst_port,
                     });
                 }
 
-                debug!("vsock muxer: RX pkt: {:?}", pkt_hdr);
-                return maybe_pkt_hdr;
+                debug!("vsock muxer: RX pkt: {:?}", *pkt.hdr);
+                return Ok(())
             }
         }
 
-        None
+        Err(VsockError::NoData)
     }
 
-    // TODO: is this return value right?
-    // true == packet consumed
-    fn send_pkt(&mut self, pkt: &VsockPacket) -> bool {
+    fn send_pkt(&mut self, pkt: &VsockPacket) -> VsockResult<()> {
 
         let conn_key = ConnMapKey {
             local_port: pkt.hdr.dst_port,
@@ -447,25 +446,33 @@ impl VsockChannel for VsockMuxer {
         debug!(
             "vsock: muxer.send[rxq.len={}]: {:?}",
             self.rxq.len(),
-            pkt.hdr
+            *pkt.hdr
         );
 
         // TODO: clean up this limit (set a const, etc)
         if self.rxq.len() >= 256 {
             info!("vsock: muxer.rxq full; refusing send()");
-            return false;
+            return Err(VsockError::OutOfResources);
         }
 
 
-        // TODO: if type != stream, send RST
+        if pkt.hdr.type_ != uapi::VSOCK_TYPE_STREAM {
+            self.rxq.push_back(MuxerRx::RstPkt {
+                local_port: pkt.hdr.dst_port,
+                peer_port: pkt.hdr.src_port
+            });
+            return Ok(());
+        }
 
-        // TODO: validate pkt. e.g. type = stream, cid, etc
-        //
+        if pkt.hdr.dst_cid != uapi::VSOCK_HOST_CID {
+            info!("vsock: dropping guest packet for unknown cid: {:?}", *pkt.hdr);
+            return Ok(());
+        }
 
         if !self.conn_map.contains_key(&conn_key) {
             if pkt.hdr.op != uapi::VSOCK_OP_REQUEST {
-                info!("vsock: dropping unexpected packet from guest: {:?}", pkt.hdr);
-                return true;
+                info!("vsock: dropping unexpected packet from guest: {:?}", *pkt.hdr);
+                return Ok(());
             }
 
             match self.handle_peer_request_pkt(&pkt) {
@@ -482,19 +489,20 @@ impl VsockChannel for VsockMuxer {
                 }
             }
 
-            return true;
+            return Ok(());
         }
 
         if pkt.hdr.op == uapi::VSOCK_OP_RST {
             self.remove_connection(conn_key);
-            return true;
+            return Ok(());
         }
 
+        let mut res = Err(VsockError::NoData);
         self.apply_conn_mutation(conn_key, |conn| {
-            conn.send_pkt(pkt);
+            res = conn.send_pkt(pkt);
         });
 
-        true
+        res
     }
 
 }

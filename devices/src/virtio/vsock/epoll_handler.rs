@@ -13,7 +13,7 @@ use super::super::super::{DeviceEventT, Error as DeviceError};
 use super::super::queue::Queue as VirtQueue;
 use super::super::{EpollHandlerPayload, VIRTIO_MMIO_INT_VRING};
 use super::{EpollHandler, VsockBackend};
-use super::packet::{VsockPacket, VsockPacketBuf};
+use super::packet::{VsockPacket};
 use super::defs;
 
 
@@ -48,26 +48,24 @@ impl<B> VsockEpollHandler<B> where B: VsockBackend {
 
         let mut raise_irq = false;
 
-        // TODO: rewrite this; it's ugly.
-
         while let Some(head) = self.rxvq.iter(&self.mem).next() {
 
-            let mut used_len = 0;
-
-            if let Some(buf_desc) = head.next_descriptor() {
-                // TODO: check buf_desc.is_write_only()
-                if let Ok(mut pkt_buf) = VsockPacketBuf::from_virtq_desc(&buf_desc) {
-                    if let Some(pkt_hdr) = self.backend.recv_pkt(&mut pkt_buf) {
-                        if let Ok(hdr_size) = pkt_hdr.write_to_virtq_desc(&head) {
-                            used_len = (hdr_size as u32) + pkt_hdr.len;
-                        }
+            let used_len = match VsockPacket::from_rx_virtq_head(&head) {
+                Ok(mut pkt) => {
+                    if self.backend.recv_pkt(&mut pkt).is_ok() {
+                        pkt.hdr.as_slice().len() as u32 + pkt.hdr.len
                     }
                     else {
                         self.rxvq.go_to_previous_position();
                         break;
                     }
+                },
+                Err(e) => {
+                    warn!("vsock: RX queue error: {:?}", e);
+                    0
                 }
-            }
+            };
+
             raise_irq = true;
             self.rxvq.add_used(&self.mem, head.index, used_len);
         }
@@ -81,29 +79,30 @@ impl<B> VsockEpollHandler<B> where B: VsockBackend {
 
         debug!("vsock: epoll_handler::process_tx()");
 
-        let mut raise_irq = false;
+        let mut have_used = false;
 
         while let Some(head) = self.txvq.iter(&self.mem).next() {
-            let pkt = match VsockPacket::from_virtq_head(&head) {
+            let pkt = match VsockPacket::from_tx_virtq_head(&head) {
                 Ok(pkt) => pkt,
                 Err(e) => {
                     error!("vsock: error reading TX packet: {:?}", e);
-                    raise_irq = true;
+                    have_used = true;
                     self.txvq.add_used(&self.mem, head.index, 0);
                     continue;
                 }
             };
 
-            if self.backend.send_pkt(&pkt) != true {
+            if self.backend.send_pkt(&pkt).is_err() {
                 self.txvq.go_to_previous_position();
                 break;
             }
 
-            raise_irq = true;
+            have_used = true;
             self.txvq.add_used(&self.mem, head.index, 0);
         }
 
-        if raise_irq {
+        if have_used {
+            self.process_rx();
             self.signal_used_queue().unwrap_or_default();
         }
     }

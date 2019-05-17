@@ -7,8 +7,9 @@ use std::num::Wrapping;
 use std::os::unix::net::UnixStream;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use super::super::packet::{VsockPacket, VsockPacketHdr, VsockPacketBuf};
+use super::super::packet::{VsockPacket};
 use super::super::defs::uapi;
+use super::super::{Result as VsockResult, VsockError};
 use super::super::{VsockChannel, VsockEpollListener};
 use super::{Error, Result, VSOCK_TX_BUF_SIZE};
 
@@ -211,26 +212,6 @@ impl VsockConnection {
         self.peer_avail_credit() == 0
     }
 
-    fn make_pkt_hdr(&self, op: u16, flags: u32, len: u32) -> VsockPacketHdr {
-        VsockPacketHdr {
-            src_cid: uapi::VSOCK_HOST_CID,
-            dst_cid: self.peer_cid,
-            src_port: self.local_port,
-            dst_port: self.peer_port,
-            len,
-            type_: uapi::VSOCK_TYPE_STREAM,
-            op,
-            flags,
-            buf_alloc: self.buf_alloc,
-            fwd_cnt: self.fwd_cnt.0,
-            .. Default::default()
-        }
-    }
-
-    fn make_ctl_pkt_hdr(&self, op: u16) -> VsockPacketHdr {
-        self.make_pkt_hdr(op, 0, 0)
-    }
-
     fn peer_avail_credit(&self) -> usize {
         (Wrapping(self.peer_buf_alloc as u32) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
     }
@@ -243,27 +224,48 @@ impl VsockConnection {
         Ok(())
     }
 
+    fn init_pkt<'a>(&self, pkt: &'a mut VsockPacket) -> &'a mut VsockPacket {
+        for b in pkt.hdr.as_mut_slice() {
+            *b = 0;
+        }
+        pkt.hdr.src_cid = uapi::VSOCK_HOST_CID;
+        pkt.hdr.dst_cid = self.peer_cid;
+        pkt.hdr.src_port = self.local_port;
+        pkt.hdr.dst_port = self.peer_port;
+        pkt.hdr.type_ = uapi::VSOCK_TYPE_STREAM;
+        pkt.hdr.buf_alloc = self.buf_alloc;
+        pkt.hdr.fwd_cnt = self.fwd_cnt.0;
+        pkt
+    }
+
 }
 
 impl VsockChannel for VsockConnection {
 
-    fn recv_pkt(&mut self, buf: &mut VsockPacketBuf) -> Option<VsockPacketHdr> {
+    fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> VsockResult<()> {
+
+        self.init_pkt(pkt);
 
         if self.pending_rx.remove(PendingRx::Rst) {
-            return Some(self.make_ctl_pkt_hdr(uapi::VSOCK_OP_RST));
+            pkt.set_op(uapi::VSOCK_OP_RST);
+            return Ok(());
         }
 
         if self.pending_rx.remove(PendingRx::Response) {
             self.state = ConnState::Established;
-            return Some(self.make_ctl_pkt_hdr(uapi::VSOCK_OP_RESPONSE));
+            pkt.set_op(uapi::VSOCK_OP_RESPONSE);
+            return Ok(());
         }
 
         if self.pending_rx.remove(PendingRx::Request) {
-            return Some(self.make_ctl_pkt_hdr(uapi::VSOCK_OP_REQUEST));
+            pkt.set_op(uapi::VSOCK_OP_REQUEST);
+            return Ok(());
         }
 
         if self.pending_rx.remove(PendingRx::CreditUpdate) && !self.has_pending_rx() {
-            return Some(self.make_ctl_pkt_hdr(uapi::VSOCK_OP_CREDIT_UPDATE));
+            pkt.set_op(uapi::VSOCK_OP_CREDIT_UPDATE);
+            self.last_fwd_cnt_to_peer = self.fwd_cnt;
+            return Ok(());
         }
 
         self.pending_rx.remove(PendingRx::Rw);
@@ -271,59 +273,53 @@ impl VsockChannel for VsockConnection {
         match self.state {
             ConnState::Established | ConnState::PeerClosed(false, _) => (),
             _ => {
-                return Some(self.make_ctl_pkt_hdr(uapi::VSOCK_OP_RST));
+                pkt.set_op(uapi::VSOCK_OP_RST);
+                return Ok(());
             }
         }
 
         if self.need_credit_update_from_peer() {
             self.last_fwd_cnt_to_peer = self.fwd_cnt;
-            return Some(self.make_ctl_pkt_hdr(uapi::VSOCK_OP_CREDIT_REQUEST));
+            pkt.set_op(uapi::VSOCK_OP_CREDIT_REQUEST);
+            return Ok(());
         }
 
-        // `max_len` only tells us how much space the driver has made available in an RX buffer.
-        // We also need to consider how much credit the peer has left for this stream.
-        let max_len = std::cmp::min(buf.len(), self.peer_avail_credit());
-
-        // Beyond this point, we'll need to produce a data packet. No point in trying that
-        // if there's no buffer to store the data into.
+        // It's safe to unwrap here, since an RX packet will always have a buffer (this is ensured
+        // by `VsockPacket::from_rx_virtq_head()`).
         //
-        if max_len == 0 {
-            return None;
-        }
+        let buf = pkt.buf.as_mut().unwrap();
 
-        let pkt_hdr = match self.stream.read(&mut buf.as_mut_slice()[..max_len]) {
+        let max_len = std::cmp::min(buf.as_slice().len(), self.peer_avail_credit());
+
+        match self.stream.read(&mut buf.as_mut_slice()[..max_len]) {
             Ok(read_cnt) => {
                 if read_cnt == 0 {
                     self.state = ConnState::LocalClosed;
-                    self.make_pkt_hdr(
-                        uapi::VSOCK_OP_SHUTDOWN,
-                        uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND,
-                        0,
-                    )
+                    pkt.set_op(uapi::VSOCK_OP_SHUTDOWN)
+                        .set_flag(uapi::VSOCK_FLAGS_SHUTDOWN_RCV)
+                        .set_flag(uapi::VSOCK_FLAGS_SHUTDOWN_SEND);
                 }
                 else {
-                    self.make_pkt_hdr(
-                        uapi::VSOCK_OP_RW,
-                        0,
-                        read_cnt as u32,
-                    )
+                    pkt.set_op(uapi::VSOCK_OP_RW)
+                        .set_len(read_cnt as u32);
                 }
             },
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
-                    return None;
+                    return Err(VsockError::NoData);
                 }
-                self.make_ctl_pkt_hdr(uapi::VSOCK_OP_RST)
+                pkt.set_op(uapi::VSOCK_OP_RST);
             }
         };
 
-        self.rx_cnt += Wrapping(pkt_hdr.len);
+        self.rx_cnt += Wrapping(pkt.hdr.len);
         self.last_fwd_cnt_to_peer = self.fwd_cnt;
-        Some(pkt_hdr)
+
+        Ok(())
     }
 
 
-    fn send_pkt(&mut self, pkt: &VsockPacket) -> bool {
+    fn send_pkt(&mut self, pkt: &VsockPacket) -> VsockResult<()> {
 
         self.peer_buf_alloc = pkt.hdr.buf_alloc;
         self.peer_fwd_cnt = Wrapping(pkt.hdr.fwd_cnt);
@@ -337,7 +333,7 @@ impl VsockChannel for VsockConnection {
                         "vsock: dropping empty data packet from guest (lp={}, pp={}",
                         self.local_port, self.peer_port
                     );
-                    return true;
+                    return Ok(());
                 }
                 let buf_slice = &pkt.buf.as_ref().unwrap().as_slice()[..(pkt.hdr.len as usize)];
                 if let Err(err) = self.send_bytes(buf_slice) {
@@ -388,12 +384,12 @@ impl VsockChannel for VsockConnection {
             _ => {
                 debug!(
                     "vsock: dropping invalid TX pkt for connection: state={:?}, pkt.hdr={:?}",
-                    self.state, pkt.hdr
+                    self.state, *pkt.hdr
                 );
             }
         };
 
-        true
+        Ok(())
     }
 
 }

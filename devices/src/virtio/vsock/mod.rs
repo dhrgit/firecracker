@@ -20,7 +20,7 @@ use std::os::unix::io::{RawFd};
 use memory_model::GuestMemoryError;
 
 use super::super::EpollHandler;
-use self::packet::{VsockPacket, VsockPacketBuf, VsockPacketHdr};
+use self::packet::{VsockPacket};
 
 
 mod defs {
@@ -73,9 +73,11 @@ mod defs {
 #[derive(Debug)]
 pub enum VsockError {
     BufDescTooSmall,
-    DescriptorChainTooShort,
+    BufDescMissing,
     HdrDescTooSmall(u32),
     InvalidPktLen(u32),
+    NoData,
+    OutOfResources,
     UnreadableDescriptor,
     UnwritableDescriptor,
     GeneralError,
@@ -119,8 +121,8 @@ pub trait VsockEpollListener {
 }
 
 pub trait VsockChannel {
-    fn recv_pkt(&mut self, buf: &mut VsockPacketBuf) -> Option<VsockPacketHdr>;
-    fn send_pkt(&mut self, pkt: &VsockPacket) -> bool;
+    fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<()>;
+    fn send_pkt(&mut self, pkt: &VsockPacket) -> Result<()>;
 }
 
 pub trait VsockBackend : VsockChannel + VsockEpollListener + Send {}
