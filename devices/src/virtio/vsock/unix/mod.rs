@@ -14,5 +14,7 @@ pub enum Error {
     BufferFull,
     IoError(std::io::Error),
     ProtocolError,
+    QueueFull,
+    TooManyConnections,
 }
 type Result<T> = std::result::Result<T, Error>;

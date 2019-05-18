@@ -80,7 +80,6 @@ pub enum VsockError {
     OutOfResources,
     UnreadableDescriptor,
     UnwritableDescriptor,
-    GeneralError,
     GuestMemory(GuestMemoryError),
     GuestMemoryBounds,
     IoError(std::io::Error),

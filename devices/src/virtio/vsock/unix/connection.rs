@@ -86,6 +86,7 @@ pub struct VsockConnection {
     last_fwd_cnt_to_peer: Wrapping<u32>,
 
     pending_rx: PendingRxSet,
+    muxer_flags: u16,
 }
 
 impl VsockConnection {
@@ -112,6 +113,7 @@ impl VsockConnection {
             rx_cnt: Wrapping(0),
             last_fwd_cnt_to_peer: Wrapping(0),
             pending_rx: PendingRxSet::from(PendingRx::Response),
+            muxer_flags: 0,
         }
     }
 
@@ -134,12 +136,41 @@ impl VsockConnection {
             peer_fwd_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
             last_fwd_cnt_to_peer: Wrapping(0),
-            pending_rx: PendingRxSet::from(PendingRx::Request)
+            pending_rx: PendingRxSet::from(PendingRx::Request),
+            muxer_flags: 0,
         }
     }
 
     pub fn has_pending_rx(&self) -> bool {
         !self.pending_rx.is_empty()
+    }
+
+    pub fn get_muxer_flag(&self, flag: u16) -> bool {
+        self.muxer_flags & flag != 0
+    }
+
+    pub fn set_muxer_flag(&mut self, flag: u16) -> bool {
+        let res = self.get_muxer_flag(flag);
+        self.muxer_flags |= flag;
+        res
+    }
+
+    pub fn clear_muxer_flag(&mut self, flag: u16) -> bool {
+        let res = self.get_muxer_flag(flag);
+        self.muxer_flags &= !flag;
+        res
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        !self.pending_rx.contains(PendingRx::Rst) &&
+        match self.state {
+            ConnState::PeerClosed(true, true) | ConnState::LocalClosed => true,
+            _ => false,
+        }
+    }
+
+    pub fn kill(&mut self) {
+        self.pending_rx.insert(PendingRx::Rst);
     }
 
     // true -> tx buf empty
@@ -418,15 +449,14 @@ impl VsockEpollListener for VsockConnection {
             self.pending_rx.insert(PendingRx::Rw);
         }
         if evset.contains(epoll::Events::EPOLLOUT) {
-            self.flush_tx_buf()
-                .unwrap_or_else(|err| {
-                    info!(
-                        "vsock: error flushing TX buf for (lp={}, pp={}): {:?}",
-                        self.local_port, self.peer_port, err
-                    );
-                    self.pending_rx.insert(PendingRx::Rst);
-                    false
-                });
+            self.flush_tx_buf().unwrap_or_else(|err| {
+                info!(
+                    "vsock: error flushing TX buf for (lp={}, pp={}): {:?}",
+                    self.local_port, self.peer_port, err
+                );
+                self.kill();
+                false
+            });
         }
     }
 

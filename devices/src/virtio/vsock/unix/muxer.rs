@@ -7,12 +7,23 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::io::{RawFd, AsRawFd};
+use std::time::{Instant};
 
 use super::super::defs::uapi;
 use super::super::packet::{VsockPacket};
 use super::super::{VsockBackend, VsockChannel, VsockEpollListener, VsockError, Result as VsockResult};
 use super::connection::VsockConnection;
 use super::{Error, Result};
+
+
+const MAX_CONNECTIONS: usize = 1023;
+
+const RXQ_SIZE: usize = 256;
+const KILLQ_SIZE: usize = 128;
+const KILLQ_TIMEOUT_MS: u64 = 3000;
+
+const MCF_RXQ: u16 = 1 << 0;
+const MCF_KILLQ: u16 = 1 << 1;
 
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -41,15 +52,17 @@ enum EpollListener {
 }
 
 pub struct VsockMuxer {
-    rxq: VecDeque<MuxerRx>,
+    cid: u64,
     conn_map: HashMap<ConnMapKey, VsockConnection>,
     listener_map: HashMap<RawFd, EpollListener>,
-    cid: u64,
+    rxq: MuxerRxQ,
+    killq: MuxerKillQ,
     host_sock: UnixListener,
     host_sock_path: String,
     epoll_fd: RawFd,
     local_port_set: HashSet<u32>,
     local_port_last: u32,
+    last_killq_sweep_time: Instant,
 }
 
 
@@ -69,15 +82,17 @@ impl VsockMuxer {
             .map_err(Error::IoError)?;
 
         let mut muxer = Self {
-            rxq: VecDeque::new(),
-            conn_map: HashMap::new(),
-            listener_map: HashMap::new(),
             cid,
             host_sock,
             host_sock_path,
             epoll_fd,
+            rxq: MuxerRxQ::new(),
+            conn_map: HashMap::with_capacity(MAX_CONNECTIONS),
+            listener_map: HashMap::with_capacity(MAX_CONNECTIONS + 1),
+            killq: MuxerKillQ::new(),
             local_port_last: (1u32 << 31),
-            local_port_set: HashSet::new(),
+            local_port_set: HashSet::with_capacity(MAX_CONNECTIONS),
+            last_killq_sweep_time: Instant::now(),
         };
 
         muxer.add_listener(muxer.host_sock.as_raw_fd(), EpollListener::HostSock)?;
@@ -90,6 +105,11 @@ impl VsockMuxer {
             "vsock: muxer processing event: fd={}, evset={:?}",
             fd, evset
         );
+
+        if Instant::now().duration_since(self.last_killq_sweep_time).as_secs() > KILLQ_TIMEOUT_MS/1000 {
+            self.sweep_killq();
+        }
+
         match self.listener_map.get_mut(&fd) {
 
             Some(EpollListener::Connection {key, evset}) => {
@@ -117,10 +137,7 @@ impl VsockMuxer {
                             stream.as_raw_fd(),
                             EpollListener::LocalStream(stream)
                         ).unwrap_or_else(|err| {
-                            warn!(
-                                "vsock: unable to add listener for local connection: {:?}",
-                                err
-                            );
+                            warn!("vsock: unable to add listener for local connection: {:?}", err);
                         });
                     },
                     Err(err) => {
@@ -146,10 +163,8 @@ impl VsockMuxer {
                                         local_port,
                                         peer_port,
                                     )
-                                ).and_then(|_| {
-                                    self.rxq.push_back(MuxerRx::ConnRx(conn_key));
-                                    Ok(())
-                                }).unwrap_or_else(|err| {
+                                ).unwrap_or_else(|err| {
+                                    self.free_local_port(local_port);
                                     error!("vsock: error adding connection: {:?}", err);
                                 });
                             }
@@ -185,17 +200,24 @@ impl VsockMuxer {
     }
 
 
-    fn add_connection(&mut self, key: ConnMapKey, conn: VsockConnection) -> Result<()> {
+    fn add_connection(&mut self, key: ConnMapKey, mut conn: VsockConnection) -> Result<()> {
+
+        if self.conn_map.len() >= MAX_CONNECTIONS {
+            info!("vsock: muxer connection limit reached ({})", MAX_CONNECTIONS);
+            return Err(Error::TooManyConnections);
+        }
 
         self.add_listener(
             conn.get_polled_fd(),
             EpollListener::Connection {key, evset: epoll::Events::EPOLLIN}
         ).and_then(|_| {
+            if conn.has_pending_rx() {
+                if self.rxq.push(MuxerRx::ConnRx(key)).is_ok() {
+                    conn.set_muxer_flag(MCF_RXQ);
+                }
+            }
             self.conn_map.insert(key, conn);
             Ok(())
-        }).map_err(|err| {
-            debug!("vsock: error adding listener: {:?}", err);
-            err
         })
     }
 
@@ -205,6 +227,24 @@ impl VsockMuxer {
         }
         self.conn_map.remove(&key);
         self.free_local_port(key.local_port);
+    }
+
+    fn remove_connection_with_rst(&mut self, key: ConnMapKey) {
+        if !self.rxq.is_full() {
+            // There's room left in self.rxq, so it's safe to unwrap here.
+            self.rxq.push(MuxerRx::RstPkt {
+                local_port: key.local_port,
+                peer_port: key.peer_port,
+            }).unwrap();
+            self.remove_connection(key);
+        }
+        else {
+            self.conn_map.entry(key).and_modify(|conn| {
+                conn.kill();
+            });
+            // This will fail, but we have to do it anyway, so that rxq.synced gets updated.
+            self.rxq.push(MuxerRx::ConnRx(key)).unwrap_or_default();
+        }
     }
 
     fn add_listener(&mut self, fd: RawFd, listener: EpollListener) -> Result<()> {
@@ -270,43 +310,57 @@ impl VsockMuxer {
         self.local_port_set.remove(&port);
     }
 
-    fn handle_peer_request_pkt(&mut self, pkt: &VsockPacket) -> Result<()> {
+    fn handle_peer_request_pkt(&mut self, pkt: &VsockPacket) {
 
         let port_path = format!("{}_{}", self.host_sock_path, pkt.hdr.dst_port);
-        let stream = UnixStream::connect(port_path)
+
+        UnixStream::connect(port_path)
             .and_then(|stream| {
                 stream.set_nonblocking(true).map(|_| stream)
             })
-            .map_err(Error::IoError)?;
-
-        let conn_key = ConnMapKey {
-            local_port: pkt.hdr.dst_port,
-            peer_port: pkt.hdr.src_port,
-        };
-        let conn = VsockConnection::new_peer_init(
-            stream,
-            self.cid,
-            pkt.hdr.dst_port,
-            pkt.hdr.src_port,
-            pkt.hdr.buf_alloc,
-        );
-        self.add_connection(conn_key, conn)
-            .and_then(|_| {
-                self.rxq.push_back(MuxerRx::ConnRx(conn_key));
-                Ok(())
-            })?;
-
-        Ok(())
+            .map_err(Error::IoError)
+            .and_then(|stream| {
+                self.add_connection(
+                    ConnMapKey {
+                        local_port: pkt.hdr.dst_port,
+                        peer_port: pkt.hdr.src_port,
+                    },
+                    VsockConnection::new_peer_init(
+                        stream,
+                        self.cid,
+                        pkt.hdr.dst_port,
+                        pkt.hdr.src_port,
+                        pkt.hdr.buf_alloc,
+                    )
+                )
+            })
+            .unwrap_or_else(|_| {
+                self.rxq.push(MuxerRx::RstPkt {
+                    local_port: pkt.hdr.dst_port,
+                    peer_port: pkt.hdr.src_port,
+                }).unwrap_or_else(|_| {
+                    info!("vsock: muxer.rxq full - unable to enqueue RST for peer");
+                });
+            });
     }
 
     fn apply_conn_mutation<F>(&mut self, key: ConnMapKey, mut_fn: F)
         where F: FnOnce(&mut VsockConnection)
     {
         if let Some(conn) = self.conn_map.get_mut(&key) {
-            let had_rx = conn.has_pending_rx();
+
             mut_fn(conn);
-            if !had_rx && conn.has_pending_rx() {
-                self.rxq.push_back(MuxerRx::ConnRx(key));
+
+            if conn.has_pending_rx() && !conn.get_muxer_flag(MCF_RXQ) {
+                if self.rxq.push(MuxerRx::ConnRx(key)).is_ok() {
+                    conn.set_muxer_flag(MCF_RXQ);
+                }
+            }
+
+            if conn.is_shutting_down() && !conn.get_muxer_flag(MCF_KILLQ) {
+                if self.killq.push(key).is_ok() {
+                    conn.set_muxer_flag(MCF_KILLQ);
+                }
             }
 
             let fd = conn.get_polled_fd();
@@ -334,7 +388,7 @@ impl VsockMuxer {
                             "vsock: error updating epoll listener for (lp={}, pp={}): {:?}",
                             key.local_port, key.peer_port, err
                         );
-                        self.remove_connection(key);
+                        self.remove_connection_with_rst(key);
                     });
                 }
             }
@@ -347,9 +401,29 @@ impl VsockMuxer {
                         "vsock: error adding epoll listener for (lp={}, pp={}): {:?}",
                         key.local_port, key.peer_port, err
                     );
-                    self.remove_connection(key);
+                    self.remove_connection_with_rst(key);
                 });
             }
+        }
+    }
+
+    fn sweep_killq(&mut self) {
+
+        self.last_killq_sweep_time = Instant::now();
+
+        while let Some(key) = self.killq.pop() {
+
+            debug!(
+                "vsock: muxer killing timedout connection (lp={}, pp={})",
+                key.local_port, key.peer_port
+            );
+
+            self.remove_connection_with_rst(key);
+        }
+
+        if !self.killq.is_synced() {
+            self.killq.sync(&mut self.conn_map)
+                .unwrap_or_default();
         }
     }
 
@@ -393,9 +467,11 @@ impl VsockChannel for VsockMuxer {
 
     fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> VsockResult<()> {
 
-        debug!("vsock: muxer[rxq.len={}] recv_pkt()", self.rxq.len());
+        if !self.rxq.is_synced() {
+            self.rxq.sync(&mut self.conn_map).unwrap_or_default();
+        }
 
-        while let Some(rx) = self.rxq.pop_front() {
+        while let Some(rx) = self.rxq.pop() {
 
             let res = match rx {
                 MuxerRx::RstPkt{local_port, peer_port} => {
@@ -414,6 +490,7 @@ impl VsockChannel for VsockMuxer {
                 MuxerRx::ConnRx(key) => {
                     let mut conn_res = Err(VsockError::NoData);
                     self.apply_conn_mutation(key, |conn| {
+                        conn.clear_muxer_flag(MCF_RXQ);
                         conn_res = conn.recv_pkt(pkt);
                     });
                     conn_res
@@ -449,46 +526,33 @@ impl VsockChannel for VsockMuxer {
             *pkt.hdr
         );
 
-        // TODO: clean up this limit (set a const, etc)
-        if self.rxq.len() >= 256 {
-            info!("vsock: muxer.rxq full; refusing send()");
-            return Err(VsockError::OutOfResources);
-        }
-
-
         if pkt.hdr.type_ != uapi::VSOCK_TYPE_STREAM {
-            self.rxq.push_back(MuxerRx::RstPkt {
+            self.rxq.push(MuxerRx::RstPkt {
                 local_port: pkt.hdr.dst_port,
-                peer_port: pkt.hdr.src_port
+                peer_port: pkt.hdr.src_port,
+            }).unwrap_or_else(|_| {
+                info!("vsock: muxer rxq full - unable to send RST to guest");
             });
             return Ok(());
         }
 
         if pkt.hdr.dst_cid != uapi::VSOCK_HOST_CID {
-            info!("vsock: dropping guest packet for unknown cid: {:?}", *pkt.hdr);
+            info!("vsock: dropping guest packet for unknown CID: {:?}", *pkt.hdr);
             return Ok(());
         }
 
         if !self.conn_map.contains_key(&conn_key) {
-            if pkt.hdr.op != uapi::VSOCK_OP_REQUEST {
-                info!("vsock: dropping unexpected packet from guest: {:?}", *pkt.hdr);
-                return Ok(());
+            if pkt.hdr.op == uapi::VSOCK_OP_REQUEST {
+                self.handle_peer_request_pkt(&pkt);
             }
-
-            match self.handle_peer_request_pkt(&pkt) {
-                Ok(()) => self.rxq.push_back(MuxerRx::ConnRx(conn_key)),
-                Err(err) => {
-                    self.rxq.push_back(MuxerRx::RstPkt {
-                        local_port: pkt.hdr.dst_port,
-                        peer_port: pkt.hdr.src_port
-                    });
-                    info!(
-                        "vsock: error accepting connection request from guest (lp={}, pp={}): {:?}",
-                        conn_key.local_port, conn_key.peer_port, err
-                    );
-                }
+            else {
+                self.rxq.push(MuxerRx::RstPkt {
+                    local_port: pkt.hdr.dst_port,
+                    peer_port: pkt.hdr.src_port,
+                }).unwrap_or_else(|_| {
+                    info!("vsock: muxer.rxq full - unable to send RST to guest");
+                });
             }
-
             return Ok(());
         }
 
@@ -508,3 +572,99 @@ impl VsockChannel for VsockMuxer {
 }
 
 impl VsockBackend for VsockMuxer {}
+
+struct MuxerRxQ {
+    q: VecDeque<MuxerRx>,
+    synced: bool,
+}
+
+impl MuxerRxQ {
+    pub fn new() -> Self {
+        Self {
+            q: VecDeque::with_capacity(RXQ_SIZE),
+            synced: true,
+        }
+    }
+    pub fn push(&mut self, rx: MuxerRx) -> Result<()> {
+        if self.q.len() < RXQ_SIZE {
+            self.q.push_back(rx);
+            return Ok(())
+        }
+        if let MuxerRx::ConnRx(_) = rx {
+            self.synced = false;
+        }
+        Err(Error::QueueFull)
+    }
+    pub fn pop(&mut self) -> Option<MuxerRx> {
+        self.q.pop_front()
+    }
+    pub fn sync(&mut self, conn_map: &mut HashMap<ConnMapKey, VsockConnection>) -> Result<()> {
+        for (key, conn) in conn_map.iter_mut() {
+            if conn.has_pending_rx() && !conn.get_muxer_flag(MCF_RXQ) {
+                self.push(MuxerRx::ConnRx(*key))?;
+                conn.set_muxer_flag(MCF_RXQ);
+            }
+        }
+        self.synced = true;
+        Ok(())
+    }
+    pub fn is_synced(&self) -> bool {
+        self.synced
+    }
+    pub fn len(&self) -> usize {
+        self.q.len()
+    }
+    pub fn is_full(&self) -> bool {
+        self.len() == RXQ_SIZE
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MuxerKillQItem {
+    key: ConnMapKey,
+    sched_time: Instant,
+}
+struct MuxerKillQ {
+    q: VecDeque<MuxerKillQItem>,
+    synced: bool,
+}
+impl MuxerKillQ {
+    pub fn new() -> Self {
+        Self {
+            q: VecDeque::with_capacity(KILLQ_SIZE),
+            synced: true,
+        }
+    }
+    pub fn push(&mut self, key: ConnMapKey) -> Result<()> {
+        if self.q.len() < KILLQ_SIZE {
+            self.q.push_back(MuxerKillQItem {
+                key,
+                sched_time: Instant::now(),
+            });
+            return Ok(());
+        }
+        self.synced = false;
+        Err(Error::QueueFull)
+    }
+    pub fn pop(&mut self) -> Option<ConnMapKey> {
+        if let Some(item) = self.q.front() {
+            let elapsed = item.sched_time.duration_since(Instant::now());
+            if elapsed.as_secs()*1000 + u64::from(elapsed.subsec_millis()) >= KILLQ_TIMEOUT_MS {
+                return Some(self.q.pop_front().unwrap().key);
+            }
+        }
+        None
+    }
+    pub fn sync(&mut self, conn_map: &mut HashMap<ConnMapKey, VsockConnection>) -> Result<()> {
+        for (key, conn) in conn_map.iter_mut() {
+            if conn.is_shutting_down() && !conn.get_muxer_flag(MCF_KILLQ) {
+                self.push(*key)?;
+            }
+        }
+        self.synced = true;
+        Ok(())
+    }
+    pub fn is_synced(&self) -> bool {
+        self.synced
+    }
+}
