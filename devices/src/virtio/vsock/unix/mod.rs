@@ -3,9 +3,20 @@
 
 pub mod muxer;
 mod connection;
+mod muxer_killq;
+mod muxer_rxq;
+mod txbuf;
 
 
-const VSOCK_TX_BUF_SIZE: usize = 256*1024;
+mod defs {
+    pub const MAX_CONNECTIONS: usize = 1023;
+    pub const CONN_TX_BUF_SIZE: usize = 256 * 1024;
+    pub const CONN_CREDIT_UPDATE_THRESHOLD: usize = CONN_TX_BUF_SIZE - 64 * 1024;
+    pub const CONN_SHUTDOWN_TIMEOUT_MS: u64 = 3000;
+
+    pub const MUXER_RXQ_SIZE: usize = 256;
+    pub const MUXER_KILLQ_SIZE: usize = 128;
+}
 
 
 #[derive(Debug)]

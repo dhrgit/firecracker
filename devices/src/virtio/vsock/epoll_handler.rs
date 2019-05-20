@@ -17,6 +17,13 @@ use super::packet::{VsockPacket};
 use super::defs;
 
 
+// TODO: Detect / handle queue deadlock:
+// 1. If `self.backend.send_pkt()` errors out, TX queue processing will halt. Try to process any
+//    pending backend RX, then try TX again. If it fails again, we have a deadlock.
+// 2. If the driver halts RX queue processing, we'll need to notify `self.backend`, so that it
+//    can unregister any EPOLLIN listeners, since otherwise it will keep spinning, unable to consume
+//    its EPOLLIN events.
+
 pub struct VsockEpollHandler<B: VsockBackend> {
     pub rxvq: VirtQueue,
     pub rxvq_evt: EventFd,
@@ -102,9 +109,9 @@ impl<B> VsockEpollHandler<B> where B: VsockBackend {
         }
 
         if have_used {
-            self.process_rx();
             self.signal_used_queue().unwrap_or_default();
         }
+
     }
 
 }
@@ -139,7 +146,9 @@ impl<B> EpollHandler for VsockEpollHandler<B> where B: VsockBackend {
                     });
                 } else {
                     self.process_tx();
-                    self.process_rx();
+                    if self.backend.has_pending_rx() {
+                        self.process_rx();
+                    }
                 }
             }
             defs::EVQ_EVENT => {
@@ -158,7 +167,9 @@ impl<B> EpollHandler for VsockEpollHandler<B> where B: VsockBackend {
                     self.backend.notify(evset);
                     // This event may have caused some packets to be queued up by the backend.
                     // Make sure they are processed.
-                    self.process_rx();
+                    if self.backend.has_pending_rx() {
+                        self.process_rx();
+                    }
                 }
                 else {
                     warn!("vsock: unexpected backend event flags={:08x}", evset_bits);

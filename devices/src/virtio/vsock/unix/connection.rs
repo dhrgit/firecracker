@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::io::{Read, Write, ErrorKind};
+use std::io::{Read, Write};
 use std::num::Wrapping;
 use std::os::unix::net::UnixStream;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -11,7 +11,8 @@ use super::super::packet::{VsockPacket};
 use super::super::defs::uapi;
 use super::super::{Result as VsockResult, VsockError};
 use super::super::{VsockChannel, VsockEpollListener};
-use super::{Error, Result, VSOCK_TX_BUF_SIZE};
+use super::{defs as unix_defs, Error, Result};
+use super::txbuf::TxBuf;
 
 
 #[derive(Debug, PartialEq)]
@@ -21,6 +22,7 @@ pub enum ConnState {
     Established,
     LocalClosed,
     PeerClosed(bool, bool),
+    Killed,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -62,6 +64,7 @@ impl From<PendingRx> for PendingRxSet {
     }
 }
 
+
 pub struct VsockConnection {
 
     state: ConnState,
@@ -71,10 +74,8 @@ pub struct VsockConnection {
     peer_port: u32,
     stream: UnixStream,
 
-    // TODO: implement a proper ring buffer for TX
-    tx_buf: Vec<u8>,
+    tx_buf: Option<TxBuf>,
 
-    buf_alloc: u32,
     fwd_cnt: Wrapping<u32>,
     peer_buf_alloc: u32,
     peer_fwd_cnt: Wrapping<u32>,
@@ -105,8 +106,7 @@ impl VsockConnection {
             peer_port,
             stream,
             state: ConnState::PeerInit,
-            tx_buf: Vec::new(),
-            buf_alloc: VSOCK_TX_BUF_SIZE as u32,
+            tx_buf: None,
             fwd_cnt: Wrapping(0),
             peer_buf_alloc,
             peer_fwd_cnt: Wrapping(0),
@@ -129,8 +129,7 @@ impl VsockConnection {
             peer_port,
             stream,
             state: ConnState::LocalInit,
-            tx_buf: Vec::new(),
-            buf_alloc: VSOCK_TX_BUF_SIZE as u32,
+            tx_buf: None,
             fwd_cnt: Wrapping(0),
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
@@ -141,8 +140,12 @@ impl VsockConnection {
         }
     }
 
-    pub fn has_pending_rx(&self) -> bool {
-        !self.pending_rx.is_empty()
+    pub fn is_shutting_down(&self) -> bool {
+        !self.pending_rx.contains(PendingRx::Rst) &&
+            match self.state {
+                ConnState::PeerClosed(true, true) | ConnState::LocalClosed => true,
+                _ => false,
+            }
     }
 
     pub fn get_muxer_flag(&self, flag: u16) -> bool {
@@ -161,82 +164,40 @@ impl VsockConnection {
         res
     }
 
-    pub fn is_shutting_down(&self) -> bool {
-        !self.pending_rx.contains(PendingRx::Rst) &&
-        match self.state {
-            ConnState::PeerClosed(true, true) | ConnState::LocalClosed => true,
-            _ => false,
-        }
-    }
-
     pub fn kill(&mut self) {
+        self.state = ConnState::Killed;
         self.pending_rx.insert(PendingRx::Rst);
     }
 
-    // true -> tx buf empty
-    // false -> some data still in tx buf
-    fn send_bytes(&mut self, buf: &[u8]) -> Result<bool> {
-        // TODO: clean this up
-        match self.flush_tx_buf() {
-            Err(e) => Err(e),
-            Ok(false) => {
-                self.push_to_tx_buf(buf)?;
-                Ok(false)
-            },
-            Ok(true) => {
-                match self.stream.write(buf) {
-                    Ok(bytes_written) => {
-                        if bytes_written < buf.len() {
-                            self.push_to_tx_buf(&buf[bytes_written..])?;
-                        }
-                        self.fwd_cnt += Wrapping(bytes_written as u32);
-                        Ok(self.tx_buf.len() == 0)
-                    },
-                    Err(e) => {
-                        if e.kind() == ErrorKind::WouldBlock {
-                            self.push_to_tx_buf(buf)?;
-                            Ok(false)
-                        }
-                        else {
-                            Err(Error::IoError(e))
-                        }
-                    }
-                }
+    fn send_bytes(&mut self, buf: &[u8]) -> Result<()> {
+
+        if self.has_data_in_tx_buf() {
+            let tx_buf = self.tx_buf.as_mut().unwrap();
+            self.fwd_cnt += Wrapping(tx_buf.flush(&mut self.stream)? as u32);
+            if tx_buf.is_empty() {
+                self.send_bytes(buf)?;
             }
-        }
-    }
-
-
-    // true -> tx buf empty
-    // false -> some data still in tx buf
-    fn flush_tx_buf(&mut self) -> Result<bool> {
-
-        if self.tx_buf.len() == 0 {
-            return Ok(true);
+            else {
+                tx_buf.push(buf)?;
+            }
+            return Ok(());
         }
 
-        let written = match self.stream.write(&self.tx_buf) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                if e.kind() == ErrorKind::WouldBlock {
-                    return Ok(false);
-                }
-                else {
-                    return Err(Error::IoError(e));
-                }
-            }
-        };
-
-        self.tx_buf = self.tx_buf.split_off(written);
+        let written = self.stream.write(buf)
+            .map_err(|e| Error::IoError(e))?;
         self.fwd_cnt += Wrapping(written as u32);
 
-        Ok(self.tx_buf.len() == 0)
+        if written < buf.len() {
+            self.tx_buf
+                .get_or_insert_with(|| TxBuf::new())
+                .push(&buf[written..])?;
+        }
+
+        Ok(())
     }
 
-
     fn peer_needs_credit_update(&self) -> bool {
-        // TODO: un-hardcode and clean this up
-        (self.fwd_cnt - self.last_fwd_cnt_to_peer).0 > (self.buf_alloc - 8192)
+        (self.fwd_cnt - self.last_fwd_cnt_to_peer).0 as usize >= unix_defs::CONN_CREDIT_UPDATE_THRESHOLD
     }
 
     fn need_credit_update_from_peer(&self) -> bool {
@@ -245,14 +206,6 @@ impl VsockConnection {
 
     fn peer_avail_credit(&self) -> usize {
         (Wrapping(self.peer_buf_alloc as u32) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
-    }
-
-    fn push_to_tx_buf(&mut self, buf: &[u8]) -> Result<()> {
-        if self.tx_buf.len() + buf.len() > VSOCK_TX_BUF_SIZE {
-            return Err(Error::BufferFull);
-        }
-        self.tx_buf.extend_from_slice(buf);
-        Ok(())
     }
 
     fn init_pkt<'a>(&self, pkt: &'a mut VsockPacket) -> &'a mut VsockPacket {
@@ -264,9 +217,13 @@ impl VsockConnection {
         pkt.hdr.src_port = self.local_port;
         pkt.hdr.dst_port = self.peer_port;
         pkt.hdr.type_ = uapi::VSOCK_TYPE_STREAM;
-        pkt.hdr.buf_alloc = self.buf_alloc;
+        pkt.hdr.buf_alloc = unix_defs::CONN_TX_BUF_SIZE as u32;
         pkt.hdr.fwd_cnt = self.fwd_cnt.0;
         pkt
+    }
+
+    fn has_data_in_tx_buf(&self) -> bool {
+        self.tx_buf.is_some() && self.tx_buf.as_ref().unwrap().len() != 0
     }
 
 }
@@ -372,7 +329,8 @@ impl VsockChannel for VsockConnection {
                         "vsock: error writing to local stream (lp={}, pp={}): {:?}",
                         self.local_port, self.peer_port, err
                     );
-                    self.pending_rx.insert(PendingRx::Rst);
+                    self.kill();
+                    return Ok(());
                 }
                 if self.peer_needs_credit_update() {
                     self.pending_rx.insert(PendingRx::CreditUpdate);
@@ -380,7 +338,14 @@ impl VsockChannel for VsockConnection {
             },
 
             ConnState::LocalInit if pkt.hdr.op == uapi::VSOCK_OP_RESPONSE => {
-                self.state = ConnState::Established;
+                self.send_bytes(format!("OK {}\n", self.local_port).as_bytes())
+                    .and_then(|_| {
+                        self.state = ConnState::Established;
+                        Ok(())
+                    })
+                    .unwrap_or_else(|_| {
+                        self.kill();
+                    });
             },
 
             ConnState::Established
@@ -388,7 +353,7 @@ impl VsockChannel for VsockConnection {
                 let recv_off = pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
                 let send_off = pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
                 self.state = ConnState::PeerClosed(recv_off, send_off);
-                if recv_off && send_off && self.tx_buf.len() == 0 {
+                if recv_off && send_off && !self.has_data_in_tx_buf() {
                     self.pending_rx.insert(PendingRx::Rst);
                 }
             },
@@ -397,7 +362,7 @@ impl VsockChannel for VsockConnection {
             if pkt.hdr.op == uapi::VSOCK_OP_SHUTDOWN => {
                 *recv_off = *recv_off || (pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0);
                 *send_off = *send_off || (pkt.hdr.flags & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0);
-                if *recv_off && *send_off && self.tx_buf.len() == 0 {
+                if *recv_off && *send_off && !self.has_data_in_tx_buf() {
                     self.pending_rx.insert(PendingRx::Rst);
                 }
             },
@@ -423,6 +388,10 @@ impl VsockChannel for VsockConnection {
         Ok(())
     }
 
+    fn has_pending_rx(&self) -> bool {
+        !self.pending_rx.is_empty()
+    }
+
 }
 
 impl VsockEpollListener for VsockConnection {
@@ -433,7 +402,7 @@ impl VsockEpollListener for VsockConnection {
 
     fn get_polled_evset(&self) -> epoll::Events {
         let mut evset = epoll::Events::empty();
-        if self.tx_buf.len() > 0 {
+        if self.has_data_in_tx_buf() {
             evset.insert(epoll::Events::EPOLLOUT);
         }
         match self.state {
@@ -449,14 +418,23 @@ impl VsockEpollListener for VsockConnection {
             self.pending_rx.insert(PendingRx::Rw);
         }
         if evset.contains(epoll::Events::EPOLLOUT) {
-            self.flush_tx_buf().unwrap_or_else(|err| {
-                info!(
-                    "vsock: error flushing TX buf for (lp={}, pp={}): {:?}",
-                    self.local_port, self.peer_port, err
-                );
-                self.kill();
-                false
+            if !self.has_data_in_tx_buf() {
+                info!("vsock: unexpected EPOLLOUT event received");
+                return;
+            }
+            let flushed = self.tx_buf
+                .as_mut()
+                .unwrap()
+                .flush(&mut self.stream)
+                .unwrap_or_else(|err| {
+                    info!(
+                        "vsock: error flushing TX buf for (lp={}, pp={}): {:?}",
+                        self.local_port, self.peer_port, err
+                    );
+                    self.kill();
+                    0
             });
+            self.fwd_cnt += Wrapping(flushed as u32);
         }
     }
 

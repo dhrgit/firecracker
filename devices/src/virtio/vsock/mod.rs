@@ -122,6 +122,7 @@ pub trait VsockEpollListener {
 pub trait VsockChannel {
     fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> Result<()>;
     fn send_pkt(&mut self, pkt: &VsockPacket) -> Result<()>;
+    fn has_pending_rx(&self) -> bool;
 }
 
 pub trait VsockBackend : VsockChannel + VsockEpollListener + Send {}
