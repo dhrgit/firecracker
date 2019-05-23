@@ -1,6 +1,26 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the THIRD-PARTY file.
 
+/// This is the `VirtioDevice` implementation for our vsock device. It handles the virtio-level
+/// device logic: feature negociation, device configuration, and device activation.
+/// The run-time device logic (i.e. event-driven data handling) is implemented by
+/// `super::epoll_handler::EpollHandler`.
+///
+/// The vsock device has two input parameters: a CID to identify the device, and a `VsockBackend`
+/// to use for offloading vsock traffic.
+///
+/// Upon its activation, the vsock device creates its `EpollHandler`, passes it the event-interested
+/// file descriptors, and registers these descriptors with the VMM `EpollContext`. Going forward,
+/// the `EpollHandler` will get notified whenever an event occurs on the just-registered FDs:
+/// - an RX queue FD;
+/// - a TX queue FD;
+/// - an event queue FD; and
+/// - a backend FD.
+///
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -28,7 +48,7 @@ impl<B> Vsock<B>
 where
     B: VsockBackend,
 {
-    /// Create a new virtio-vsock device with the given VM cid.
+    /// Create a new virtio-vsock device with the given VM CID and vsock backend.
     pub fn new(cid: u64, epoll_config: EpollConfig, backend: B) -> super::Result<Vsock<B>> {
         Ok(Vsock {
             cid,
