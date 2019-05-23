@@ -127,9 +127,7 @@ impl Display for StartMicrovmError {
                 err
             ),
             CreateRateLimiter(ref err) => write!(f, "Cannot create RateLimiter: {}", err),
-            CreateVsockDevice => {
-                write!(f, "Cannot create vsock device.")
-            }
+            CreateVsockDevice => write!(f, "Cannot create vsock device."),
             CreateNetDevice(ref err) => {
                 let mut err_msg = format!("{:?}", err);
                 err_msg = err_msg.replace("\"", "");

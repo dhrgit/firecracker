@@ -216,7 +216,6 @@ def aux_bin_paths(test_session_root_path):
     They currently consist of:
 
     * a binary that can properly use the `clone()` syscall;
-    * a very simple vsock client/server application;
     * a jailer with a simple syscall whitelist;
     * a jailer with a (syscall, arguments) advanced whitelist;
     * a jailed binary that follows the seccomp rules;
@@ -228,11 +227,6 @@ def aux_bin_paths(test_session_root_path):
     _gcc_compile(
         'host_tools/newpid_cloner.c',
         cloner_bin_path
-    )
-    test_vsock_bin_path = os.path.join(test_session_root_path, 'test_vsock')
-    _gcc_compile(
-        "host_tools/test_vsock.c",
-        test_vsock_bin_path
     )
 
     seccomp_build_path = os.path.join(
@@ -277,7 +271,6 @@ def aux_bin_paths(test_session_root_path):
 
     yield {
         'cloner': cloner_bin_path,
-        'test_vsock': test_vsock_bin_path,
         'demo_basic_jailer': demo_basic_jailer,
         'demo_advanced_jailer': demo_advanced_jailer,
         'demo_harmless': demo_harmless,
@@ -285,7 +278,7 @@ def aux_bin_paths(test_session_root_path):
     }
 
 
-@pytest.fixture(params=['', 'vsock'])
+@pytest.fixture(params=[''])
 def microvm(request, test_session_root_path, aux_bin_paths):
     """Instantiate a microvm."""
     # pylint: disable=redefined-outer-name

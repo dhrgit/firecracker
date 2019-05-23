@@ -1,12 +1,11 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod muxer;
 mod connection;
+pub mod muxer;
 mod muxer_killq;
 mod muxer_rxq;
 mod txbuf;
-
 
 mod defs {
     pub const MAX_CONNECTIONS: usize = 1023;
@@ -17,7 +16,6 @@ mod defs {
     pub const MUXER_RXQ_SIZE: usize = 256;
     pub const MUXER_KILLQ_SIZE: usize = 128;
 }
-
 
 #[derive(Debug)]
 pub enum Error {

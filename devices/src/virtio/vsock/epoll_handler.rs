@@ -3,8 +3,8 @@
 //
 
 use std::result;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use memory_model::GuestMemory;
 use sys_util::EventFd;
@@ -12,10 +12,9 @@ use sys_util::EventFd;
 use super::super::super::{DeviceEventT, Error as DeviceError};
 use super::super::queue::Queue as VirtQueue;
 use super::super::{EpollHandlerPayload, VIRTIO_MMIO_INT_VRING};
-use super::{EpollHandler, VsockBackend};
-use super::packet::{VsockPacket};
 use super::defs;
-
+use super::packet::VsockPacket;
+use super::{EpollHandler, VsockBackend};
 
 // TODO: Detect / handle queue deadlock:
 // 1. If `self.backend.send_pkt()` errors out, TX queue processing will halt. Try to process any
@@ -38,7 +37,10 @@ pub struct VsockEpollHandler<B: VsockBackend> {
     pub backend: B,
 }
 
-impl<B> VsockEpollHandler<B> where B: VsockBackend {
+impl<B> VsockEpollHandler<B>
+where
+    B: VsockBackend,
+{
     fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
         debug!("vsock: raising IRQ");
         self.interrupt_status
@@ -50,23 +52,20 @@ impl<B> VsockEpollHandler<B> where B: VsockBackend {
     }
 
     fn process_rx(&mut self) {
-
         debug!("vsock: epoll_handler::process_rx()");
 
         let mut raise_irq = false;
 
         while let Some(head) = self.rxvq.iter(&self.mem).next() {
-
             let used_len = match VsockPacket::from_rx_virtq_head(&head) {
                 Ok(mut pkt) => {
                     if self.backend.recv_pkt(&mut pkt).is_ok() {
                         pkt.hdr.as_slice().len() as u32 + pkt.hdr.len
-                    }
-                    else {
+                    } else {
                         self.rxvq.go_to_previous_position();
                         break;
                     }
-                },
+                }
                 Err(e) => {
                     warn!("vsock: RX queue error: {:?}", e);
                     0
@@ -83,7 +82,6 @@ impl<B> VsockEpollHandler<B> where B: VsockBackend {
     }
 
     fn process_tx(&mut self) {
-
         debug!("vsock: epoll_handler::process_tx()");
 
         let mut have_used = false;
@@ -111,12 +109,13 @@ impl<B> VsockEpollHandler<B> where B: VsockBackend {
         if have_used {
             self.signal_used_queue().unwrap_or_default();
         }
-
     }
-
 }
 
-impl<B> EpollHandler for VsockEpollHandler<B> where B: VsockBackend {
+impl<B> EpollHandler for VsockEpollHandler<B>
+where
+    B: VsockBackend,
+{
     fn handle_event(
         &mut self,
         device_event: DeviceEventT,
@@ -170,21 +169,18 @@ impl<B> EpollHandler for VsockEpollHandler<B> where B: VsockBackend {
                     if self.backend.has_pending_rx() {
                         self.process_rx();
                     }
-                }
-                else {
+                } else {
                     warn!("vsock: unexpected backend event flags={:08x}", evset_bits);
                 }
-
             }
             other => {
                 return Err(DeviceError::UnknownEvent {
                     device: "vsock",
                     event: other,
                 });
-            },
+            }
         }
 
         Ok(())
     }
 }
-

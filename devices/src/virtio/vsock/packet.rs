@@ -5,9 +5,8 @@
 use std::ops::{Deref, DerefMut};
 
 use super::super::DescriptorChain;
-use super::{Result, VsockError};
 use super::defs;
-
+use super::{Result, VsockError};
 
 #[cfg(target_endian = "little")]
 #[derive(Clone, Copy, Debug, Default)]
@@ -35,31 +34,26 @@ impl HdrWrapper {
         if desc.len < VSOCK_PKT_HDR_SIZE as u32 {
             return Err(VsockError::HdrDescTooSmall(desc.len));
         }
-        desc.mem.checked_offset(desc.addr, VSOCK_PKT_HDR_SIZE)
+        desc.mem
+            .checked_offset(desc.addr, VSOCK_PKT_HDR_SIZE)
             .ok_or(VsockError::GuestMemoryBounds)?;
         Ok(Self::from_ptr(
-            desc.mem.get_host_address(desc.addr)
-                .map_err(VsockError::GuestMemory)?
+            desc.mem
+                .get_host_address(desc.addr)
+                .map_err(VsockError::GuestMemory)?,
         ))
     }
     fn from_ptr(ptr: *const u8) -> Self {
-        Self { ptr: ptr as *mut VsockPacketHdr }
+        #[allow(clippy::cast_ptr_alignment)]
+        Self {
+            ptr: ptr as *mut VsockPacketHdr,
+        }
     }
     pub fn as_slice(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                self.ptr as *const u8,
-                VSOCK_PKT_HDR_SIZE
-            )
-        }
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, VSOCK_PKT_HDR_SIZE) }
     }
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.ptr as *mut u8,
-                VSOCK_PKT_HDR_SIZE
-            )
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, VSOCK_PKT_HDR_SIZE) }
     }
 }
 impl Deref for HdrWrapper {
@@ -80,39 +74,32 @@ pub struct BufWrapper {
 }
 
 impl BufWrapper {
-
     pub fn from_virtq_desc(desc: &DescriptorChain) -> Result<Self> {
-        desc.mem.checked_offset(desc.addr, desc.len as usize)
+        desc.mem
+            .checked_offset(desc.addr, desc.len as usize)
             .ok_or(VsockError::GuestMemoryBounds)?;
 
         Ok(Self::from_fat_ptr(
-            desc.mem.get_host_address(desc.addr).map_err(VsockError::GuestMemory)?,
-            desc.len as usize
+            desc.mem
+                .get_host_address(desc.addr)
+                .map_err(VsockError::GuestMemory)?,
+            desc.len as usize,
         ))
     }
 
     pub fn from_fat_ptr(ptr: *const u8, len: usize) -> Self {
         Self {
             ptr: ptr as *mut u8,
-            len
+            len,
         }
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                self.ptr as *const u8,
-                self.len
-            )
-        }
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.ptr, self.len
-            )
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
     pub fn len(&self) -> usize {
@@ -120,17 +107,13 @@ impl BufWrapper {
     }
 }
 
-
 pub struct VsockPacket {
     pub hdr: HdrWrapper,
     pub buf: Option<BufWrapper>,
 }
 
-
 impl VsockPacket {
-
     pub fn from_tx_virtq_head(head: &DescriptorChain) -> Result<Self> {
-
         if head.is_write_only() {
             return Err(VsockError::UnreadableDescriptor);
         }
@@ -144,15 +127,14 @@ impl VsockPacket {
             return Ok(Self { hdr, buf: None });
         }
 
-        let buf_desc = head.next_descriptor()
-            .ok_or(VsockError::BufDescMissing)?;
+        let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
 
         if buf_desc.is_write_only() {
             return Err(VsockError::UnreadableDescriptor);
         }
 
         Ok(Self {
-            hdr: hdr,
+            hdr,
             buf: Some(BufWrapper::from_virtq_desc(&buf_desc)?),
         })
     }
@@ -164,8 +146,7 @@ impl VsockPacket {
 
         let hdr = HdrWrapper::from_virtq_desc(head)?;
 
-        let buf_desc = head.next_descriptor()
-            .ok_or(VsockError::BufDescMissing)?;
+        let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
         if !buf_desc.is_write_only() {
             return Err(VsockError::UnwritableDescriptor);
         }
@@ -174,7 +155,6 @@ impl VsockPacket {
             hdr,
             buf: Some(BufWrapper::from_virtq_desc(&buf_desc)?),
         })
-
     }
 
     pub fn set_len(&mut self, len: u32) -> &mut Self {
@@ -197,5 +177,3 @@ impl VsockPacket {
         self
     }
 }
-
-

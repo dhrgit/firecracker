@@ -5,11 +5,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use super::{Error, Result};
 use super::connection::VsockConnection;
-use super::muxer::{ConnMapKey, VsockMuxer};
 use super::defs as unix_defs;
-
+use super::muxer::{ConnMapKey, VsockMuxer};
+use super::{Error, Result};
 
 #[derive(Clone, Copy, Debug)]
 struct MuxerKillQItem {
@@ -23,7 +22,6 @@ pub struct MuxerKillQ {
 }
 
 impl MuxerKillQ {
-
     pub fn new() -> Self {
         Self {
             q: VecDeque::with_capacity(unix_defs::MUXER_KILLQ_SIZE),

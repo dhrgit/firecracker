@@ -40,6 +40,7 @@ mod tests {
         let vsock = VsockDeviceConfig {
             id: String::from("foo"),
             guest_cid: 42,
+            uds_path: "vsock.sock".to_string(),
         };
         assert!(vsock
             .clone()

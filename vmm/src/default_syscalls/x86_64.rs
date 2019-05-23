@@ -153,10 +153,8 @@ pub fn default_filter() -> Result<SeccompFilter, Error> {
             allow_syscall(libc::SYS_timerfd_settime),
             allow_syscall(libc::SYS_write),
             allow_syscall(libc::SYS_writev),
-
             allow_syscall(libc::SYS_connect),
             allow_syscall(libc::SYS_recvfrom),
-
             // TODO: limit this to AF_UNIX and SOCK_STREAM
             // SYS_socket is only currently used by devices::vsock, so AF_UNIX should be enough.
             // Cond::new(1, Eq, 1) didn't work, for some reason (AF_UNIX=1) - must look into it.

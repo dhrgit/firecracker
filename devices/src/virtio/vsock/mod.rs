@@ -10,18 +10,17 @@ mod epoll_handler;
 mod packet;
 mod unix;
 
-pub use self::device::Vsock;
 pub use self::defs::EVENT_COUNT as VSOCK_EVENTS_COUNT;
+pub use self::device::Vsock;
 pub use self::unix::muxer::VsockMuxer as VsockUnixBackend;
 
+use std::os::unix::io::RawFd;
 use std::sync::mpsc;
-use std::os::unix::io::{RawFd};
 
 use memory_model::GuestMemoryError;
 
+use self::packet::VsockPacket;
 use super::super::EpollHandler;
-use self::packet::{VsockPacket};
-
 
 mod defs {
     use crate::DeviceEventT;
@@ -39,7 +38,7 @@ mod defs {
 
     pub const QUEUE_SIZE: u16 = 256;
     pub const NUM_QUEUES: usize = 3;
-    pub const QUEUE_SIZES: &'static [u16] = &[QUEUE_SIZE; NUM_QUEUES];
+    pub const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE; NUM_QUEUES];
 
     /// Max vsock packet data/buffer size.
     pub const MAX_PKT_BUF_SIZE: usize = 64 * 1024;
@@ -69,7 +68,6 @@ mod defs {
     }
 }
 
-
 #[derive(Debug)]
 pub enum VsockError {
     BufDescTooSmall,
@@ -85,7 +83,6 @@ pub enum VsockError {
     IoError(std::io::Error),
 }
 type Result<T> = std::result::Result<T, VsockError>;
-
 
 pub struct EpollConfig {
     rxq_token: u64,
@@ -103,10 +100,10 @@ impl EpollConfig {
         sender: mpsc::Sender<Box<EpollHandler>>,
     ) -> Self {
         EpollConfig {
-            rxq_token: first_token + defs::RXQ_EVENT as u64,
-            txq_token: first_token + defs::TXQ_EVENT as u64,
-            evq_token: first_token + defs::EVQ_EVENT as u64,
-            backend_token: first_token + defs::BACKEND_EVENT as u64,
+            rxq_token: first_token + u64::from(defs::RXQ_EVENT),
+            txq_token: first_token + u64::from(defs::TXQ_EVENT),
+            evq_token: first_token + u64::from(defs::EVQ_EVENT),
+            backend_token: first_token + u64::from(defs::BACKEND_EVENT),
             epoll_raw_fd,
             sender,
         }
@@ -125,5 +122,4 @@ pub trait VsockChannel {
     fn has_pending_rx(&self) -> bool;
 }
 
-pub trait VsockBackend : VsockChannel + VsockEpollListener + Send {}
-
+pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {}

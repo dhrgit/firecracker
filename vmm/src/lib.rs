@@ -968,9 +968,7 @@ impl Vmm {
         Ok(())
     }
 
-    fn attach_vsock_devices(
-        &mut self,
-    ) -> std::result::Result<(), StartMicrovmError> {
+    fn attach_vsock_devices(&mut self) -> std::result::Result<(), StartMicrovmError> {
         let kernel_config = self
             .kernel_config
             .as_mut()
@@ -980,19 +978,16 @@ impl Vmm {
         let device_manager = self.mmio_device_manager.as_mut().unwrap();
 
         for cfg in self.vsock_device_configs.iter() {
-
             let backend = devices::virtio::vsock::VsockUnixBackend::new(
                 u64::from(cfg.guest_cid),
                 cfg.uds_path.clone(),
-            ).map_err(|_| StartMicrovmError::CreateVsockDevice)?;
+            )
+            .map_err(|_| StartMicrovmError::CreateVsockDevice)?;
 
             let epoll_config = self.epoll_context.allocate_virtio_vsock_tokens();
             let vsock_box = Box::new(
-                devices::virtio::Vsock::new(
-                    u64::from(cfg.guest_cid),
-                    epoll_config,
-                    backend,
-                ).or(Err(StartMicrovmError::CreateVsockDevice))?,
+                devices::virtio::Vsock::new(u64::from(cfg.guest_cid), epoll_config, backend)
+                    .or(Err(StartMicrovmError::CreateVsockDevice))?,
             );
             device_manager
                 .register_virtio_device(

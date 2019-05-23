@@ -1,9 +1,9 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::os::unix::io::{AsRawFd};
-use std::sync::Arc;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -11,10 +11,9 @@ use memory_model::GuestMemory;
 use sys_util::EventFd;
 
 use super::super::{ActivateError, ActivateResult, Queue as VirtQueue, VirtioDevice};
-use super::{VsockBackend};
 use super::epoll_handler::VsockEpollHandler;
-use super::{EpollConfig, defs, defs::uapi};
-
+use super::VsockBackend;
+use super::{defs, defs::uapi, EpollConfig};
 
 pub struct Vsock<B: VsockBackend> {
     cid: u64,
@@ -26,15 +25,11 @@ pub struct Vsock<B: VsockBackend> {
 }
 
 impl<B> Vsock<B>
-    where B: VsockBackend
+where
+    B: VsockBackend,
 {
     /// Create a new virtio-vsock device with the given VM cid.
-    pub fn new(
-        cid: u64,
-        epoll_config: EpollConfig,
-        backend: B,
-    ) -> super::Result<Vsock<B>> {
-
+    pub fn new(cid: u64, epoll_config: EpollConfig, backend: B) -> super::Result<Vsock<B>> {
         Ok(Vsock {
             cid,
             avail_features: 1u64 << uapi::VIRTIO_F_VERSION_1 | 1u64 << uapi::VIRTIO_F_IN_ORDER,
@@ -47,7 +42,8 @@ impl<B> Vsock<B>
 }
 
 impl<B> VirtioDevice for Vsock<B>
-    where B: VsockBackend + 'static
+where
+    B: VsockBackend + 'static,
 {
     fn device_type(&self) -> u32 {
         uapi::VIRTIO_ID_VSOCK
@@ -75,8 +71,8 @@ impl<B> VirtioDevice for Vsock<B>
 
     fn ack_features(&mut self, page: u32, value: u32) {
         let mut v = match page {
-            0 => value as u64,
-            1 => (value as u64) << 32,
+            0 => u64::from(value),
+            1 => u64::from(value) << 32,
             _ => {
                 warn!(
                     "vsock: virtio-vsock device cannot ack unknown feature page: {}",
@@ -100,9 +96,9 @@ impl<B> VirtioDevice for Vsock<B>
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         match offset {
             0 if data.len() == 8 => LittleEndian::write_u64(data, self.cid),
-            0 if data.len() == 4 => LittleEndian::write_u32(data, (self.cid & 0xffffffff) as u32),
+            0 if data.len() == 4 => LittleEndian::write_u32(data, (self.cid & 0xffff_ffff) as u32),
             4 if data.len() == 4 => {
-                LittleEndian::write_u32(data, ((self.cid >> 32) & 0xffffffff) as u32)
+                LittleEndian::write_u32(data, ((self.cid >> 32) & 0xffff_ffff) as u32)
             }
             _ => warn!(
                 "vsock: virtio-vsock received invalid read request of {} bytes at offset {}",
@@ -169,7 +165,6 @@ impl<B> VirtioDevice for Vsock<B>
         let tx_queue_rawfd = handler.txvq_evt.as_raw_fd();
         let ev_queue_rawfd = handler.evq_evt.as_raw_fd();
 
-
         self.epoll_config
             .sender
             .send(Box::new(handler))
@@ -181,7 +176,7 @@ impl<B> VirtioDevice for Vsock<B>
             rx_queue_rawfd,
             epoll::Event::new(epoll::Events::EPOLLIN, self.epoll_config.rxq_token),
         )
-            .map_err(ActivateError::EpollCtl)?;
+        .map_err(ActivateError::EpollCtl)?;
 
         epoll::ctl(
             self.epoll_config.epoll_raw_fd,
@@ -189,7 +184,7 @@ impl<B> VirtioDevice for Vsock<B>
             tx_queue_rawfd,
             epoll::Event::new(epoll::Events::EPOLLIN, self.epoll_config.txq_token),
         )
-            .map_err(ActivateError::EpollCtl)?;
+        .map_err(ActivateError::EpollCtl)?;
 
         epoll::ctl(
             self.epoll_config.epoll_raw_fd,
@@ -197,119 +192,16 @@ impl<B> VirtioDevice for Vsock<B>
             ev_queue_rawfd,
             epoll::Event::new(epoll::Events::EPOLLIN, self.epoll_config.evq_token),
         )
-            .map_err(ActivateError::EpollCtl)?;
+        .map_err(ActivateError::EpollCtl)?;
 
         epoll::ctl(
             self.epoll_config.epoll_raw_fd,
             epoll::ControlOptions::EPOLL_CTL_ADD,
             backend_fd,
             epoll::Event::new(backend_evset, self.epoll_config.backend_token),
-        ).map_err(ActivateError::EpollCtl)?;
+        )
+        .map_err(ActivateError::EpollCtl)?;
 
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-
-    use std::collections::VecDeque;
-    use std::fs::File;
-    use std::num::Wrapping;
-    use std::io::Write;
-
-    use super::*;
-    use crate::virtio::vsock::{VsockChannel, VsockEpollListener, VsockBackend};
-    use crate::virtio::vsock::packet::{VsockPacket, VsockPacketBuf, VsockPacketHdr};
-
-    pub struct DummyBackend {
-        sink: File,
-        rxq: VecDeque<VsockPacketHdr>,
-        fwd_cnt: Wrapping<u32>,
-    }
-
-    impl DummyBackend {
-        pub fn new() -> Self {
-            Self {
-                sink: File::create("/dev/null").unwrap(),
-                rxq: VecDeque::new(),
-                fwd_cnt: Wrapping(0),
-            }
-        }
-    }
-
-    impl VsockEpollListener for DummyBackend {
-        fn get_polled_fd(&self) -> RawFd {
-            -1 as RawFd
-        }
-        fn get_polled_evset(&self) -> epoll::Events {
-            epoll::Events::empty()
-        }
-        fn notify(&mut self, evset: epoll::Events) {}
-    }
-
-    impl VsockChannel for DummyBackend {
-        fn recv_pkt(&mut self, buf: VsockPacketBuf) -> Option<VsockPacket> {
-            self.rxq.pop_front()
-                .map(|hdr| {
-                    VsockPacket { hdr, buf: None }
-                })
-        }
-        fn send_pkt(&mut self, pkt: &VsockPacket) -> bool {
-            debug!("dummy muxer send pkt: {:?}", pkt.hdr);
-            match pkt.hdr.op {
-                uapi::VSOCK_OP_REQUEST => {
-                    self.rxq.push_back(
-                        VsockPacketHdr {
-                            src_cid: pkt.hdr.dst_cid,
-                            dst_cid: pkt.hdr.src_cid,
-                            src_port: pkt.hdr.dst_port,
-                            dst_port: pkt.hdr.src_port,
-                            op: uapi::VSOCK_OP_RESPONSE,
-                            type_: uapi::VSOCK_TYPE_STREAM,
-                            buf_alloc: 256 * 1024,
-                            fwd_cnt: self.fwd_cnt.0,
-                            .. Default::default()
-                        }
-                    );
-                },
-                uapi::VSOCK_OP_RW => {
-                    if let Some(buf) = pkt.buf.as_ref() {
-                        self.sink.write(&buf.as_slice()[..pkt.hdr.len as usize]).unwrap();
-                        self.fwd_cnt += Wrapping(pkt.hdr.len);
-                        self.rxq.push_back(VsockPacketHdr {
-                                src_cid: pkt.hdr.dst_cid,
-                                dst_cid: pkt.hdr.src_cid,
-                                src_port: pkt.hdr.dst_port,
-                                dst_port: pkt.hdr.src_port,
-                                op: uapi::VSOCK_OP_CREDIT_UPDATE,
-                                type_: uapi::VSOCK_TYPE_STREAM,
-                                buf_alloc: 256 * 1024,
-                                fwd_cnt: self.fwd_cnt.0,
-                                .. Default::default()
-                        });
-                    }
-                },
-                uapi::VSOCK_OP_SHUTDOWN => {
-                    self.rxq.push_back(VsockPacketHdr {
-                        src_cid: pkt.hdr.dst_cid,
-                        dst_cid: pkt.hdr.src_cid,
-                        src_port: pkt.hdr.dst_port,
-                        dst_port: pkt.hdr.src_port,
-                        op: uapi::VSOCK_OP_RST,
-                        type_: uapi::VSOCK_TYPE_STREAM,
-                        buf_alloc: 256 * 1024,
-                        fwd_cnt: self.fwd_cnt.0,
-                        .. Default::default()
-                    });
-                },
-                _ => ()
-            }
-            true
-        }
-    }
-
-    impl VsockBackend for DummyBackend {}
-
-}
-
