@@ -649,6 +649,11 @@ impl EpollContext {
         )
     }
 
+    fn allocate_virtio_vsock_tokens(&mut self) -> virtio::vsock::EpollConfig {
+        let (dispatch_base, sender) = self.allocate_tokens(virtio::vsock::VSOCK_EVENTS_COUNT);
+        virtio::vsock::EpollConfig::new(dispatch_base, self.epoll_raw_fd, sender)
+    }
+
     fn get_device_handler(&mut self, device_idx: usize) -> Result<&mut EpollHandler> {
         let maybe = &mut self.device_handlers[device_idx];
         match maybe.handler {
@@ -964,8 +969,37 @@ impl Vmm {
     }
 
     fn attach_vsock_devices(&mut self) -> std::result::Result<(), StartMicrovmError> {
-        // vsock device not yet implemented
-        Err(StartMicrovmError::CreateVsockDevice)
+        let kernel_config = self
+            .kernel_config
+            .as_mut()
+            .ok_or(StartMicrovmError::MissingKernelConfig)?;
+        // `unwrap` is suitable for this context since this should be called only after the
+        // device manager has been initialized.
+        let device_manager = self.mmio_device_manager.as_mut().unwrap();
+
+        for cfg in self.vsock_device_configs.iter() {
+            let backend = devices::virtio::vsock::VsockUnixBackend::new(
+                u64::from(cfg.guest_cid),
+                cfg.uds_path.clone(),
+            )
+            .map_err(|_| StartMicrovmError::CreateVsockDevice)?;
+
+            let epoll_config = self.epoll_context.allocate_virtio_vsock_tokens();
+            let vsock_box = Box::new(
+                devices::virtio::Vsock::new(u64::from(cfg.guest_cid), epoll_config, backend)
+                    .or(Err(StartMicrovmError::CreateVsockDevice))?,
+            );
+            device_manager
+                .register_virtio_device(
+                    self.vm.get_fd(),
+                    vsock_box,
+                    &mut kernel_config.cmdline,
+                    &cfg.id,
+                )
+                .map_err(StartMicrovmError::RegisterVsockDevice)?;
+        }
+
+        Ok(())
     }
 
     fn configure_kernel(&mut self, kernel_config: KernelConfig) {
