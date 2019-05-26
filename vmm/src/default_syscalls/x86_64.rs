@@ -7,10 +7,6 @@ use seccomp::{
     SECCOMP_LEVEL_BASIC, SECCOMP_LEVEL_NONE,
 };
 
-// See include/uapi/linux/eventpoll.h in the kernel code.
-const EPOLL_CTL_ADD: u64 = 1;
-const EPOLL_CTL_DEL: u64 = 2;
-
 // See include/uapi/asm-generic/fcntl.h in the kernel code.
 const FCNTL_FD_CLOEXEC: u64 = 1;
 const FCNTL_F_SETFD: u64 = 2;
@@ -109,13 +105,7 @@ pub fn default_filter() -> Result<SeccompFilter, Error> {
             allow_syscall(libc::SYS_clock_gettime),
             allow_syscall(libc::SYS_close),
             allow_syscall(libc::SYS_dup),
-            allow_syscall_if(
-                libc::SYS_epoll_ctl,
-                or![
-                    and![Cond::new(1, Eq, EPOLL_CTL_ADD)?],
-                    and![Cond::new(1, Eq, EPOLL_CTL_DEL)?],
-                ],
-            ),
+            allow_syscall(libc::SYS_epoll_ctl),
             #[cfg(target_env = "musl")]
             allow_syscall(libc::SYS_epoll_pwait),
             #[cfg(target_env = "gnu")]
@@ -163,6 +153,12 @@ pub fn default_filter() -> Result<SeccompFilter, Error> {
             allow_syscall(libc::SYS_timerfd_settime),
             allow_syscall(libc::SYS_write),
             allow_syscall(libc::SYS_writev),
+            allow_syscall(libc::SYS_connect),
+            allow_syscall(libc::SYS_recvfrom),
+            // TODO: limit this to AF_UNIX and SOCK_STREAM
+            // SYS_socket is only currently used by devices::vsock, so AF_UNIX should be enough.
+            // Cond::new(1, Eq, 1) didn't work, for some reason (AF_UNIX=1) - must look into it.
+            allow_syscall(libc::SYS_socket),
         ]
         .into_iter()
         .collect(),
