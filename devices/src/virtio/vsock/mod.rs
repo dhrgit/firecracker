@@ -7,6 +7,7 @@
 
 mod device;
 mod epoll_handler;
+mod packet;
 
 pub use self::defs::EVENT_COUNT as VSOCK_EVENTS_COUNT;
 pub use self::device::Vsock;
@@ -18,6 +19,7 @@ use std::sync::mpsc;
 use memory_model::GuestMemoryError;
 
 use super::super::EpollHandler;
+use packet::VsockPacket;
 
 #[allow(dead_code)]
 mod defs {
@@ -183,9 +185,6 @@ pub trait VsockChannel {
 /// translates guest-side vsock connections to host-side Unix domain socket connections.
 pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {}
 
-
-/// Placeholder for a to-be-defined packet struct.
-pub struct VsockPacket {}
 
 /// Placeholder implementor for a future vsock backend.
 pub struct DummyBackend {}
