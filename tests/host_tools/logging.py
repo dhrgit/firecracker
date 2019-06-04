@@ -51,7 +51,7 @@ class Fifo:
 
     def _open_nonblocking(self):
         """Open a FIFO as read-only and non-blocking."""
-        fifo = open(self.path, "r")
+        fifo = open(self.path, "rb")
         fd = fifo.fileno()
         flag = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flag | os.O_NONBLOCK)
