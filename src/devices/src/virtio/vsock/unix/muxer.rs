@@ -35,6 +35,7 @@ use std::io::Read;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 
+use super::super::csm::ConnState;
 use super::super::defs::uapi;
 use super::super::packet::VsockPacket;
 use super::super::{
@@ -79,12 +80,20 @@ enum EpollListener {
     LocalStream(UnixStream),
 }
 
+enum LocalCmd {
+    Connect(u32),
+    Upgrade(u32),
+}
+
 /// The vsock connection multiplexer.
 pub struct VsockMuxer {
     /// Guest CID.
     cid: u64,
     /// A hash map used to store the active connections.
     conn_map: HashMap<ConnMapKey, MuxerConnection>,
+    /// A set storing the keys for the connections that have been initiated by the host via the
+    /// `UPGRADE` method, and thusly require some status acknownledgement from us.
+    pending_acks: HashSet<ConnMapKey>,
     /// A hash map used to store epoll event listeners / handlers.
     listener_map: HashMap<RawFd, EpollListener>,
     /// The RX queue. Items in this queue are consumed by `VsockMuxer::recv_pkt()`, and
@@ -231,10 +240,22 @@ impl VsockChannel for VsockMuxer {
         // However, if this is an RST, we have to forcefully terminate the connection, so
         // there's no point in forwarding it the packet.
         if pkt.op() == uapi::VSOCK_OP_RST {
+            // If this is a "connection refused" RST, we may need to pass the bad news on to the
+            // host end.
+            if self.pending_acks.contains(&conn_key) {
+                self.conn_map
+                    .entry(conn_key)
+                    .and_modify(|conn| {
+                        if conn.state() == ConnState::LocalInit {
+                            conn.send_bytes(b"503 Service Unavailable\n")
+                                .unwrap_or_default()
+                        }
+                    });
+            }
             self.remove_connection(conn_key);
             return Ok(());
         }
-
+        
         // Alright, everything looks in order - forward this packet to its owning connection.
         let mut res: VsockResult<()> = Ok(());
         self.apply_conn_mutation(conn_key, |conn| {
@@ -314,6 +335,7 @@ impl VsockMuxer {
             epoll_fd,
             rxq: MuxerRxQ::new(),
             conn_map: HashMap::with_capacity(defs::MAX_CONNECTIONS),
+            pending_acks: HashSet::new(),
             listener_map: HashMap::with_capacity(defs::MAX_CONNECTIONS + 1),
             killq: MuxerKillQ::new(),
             local_port_last: (1u32 << 30) - 1,
@@ -380,8 +402,17 @@ impl VsockMuxer {
             // "connect" command that we're expecting.
             Some(EpollListener::LocalStream(_)) => {
                 if let Some(EpollListener::LocalStream(mut stream)) = self.remove_listener(fd) {
-                    Self::read_local_stream_port(&mut stream)
-                        .and_then(|peer_port| Ok((self.allocate_local_port(), peer_port)))
+                    Self::read_local_cmd(&mut stream)
+                        .and_then(|cmd| {
+                            match cmd {
+                                LocalCmd::Connect(peer_port) => Ok((self.allocate_local_port(), peer_port)),
+                                LocalCmd::Upgrade(peer_port) => {
+                                    let local_port = self.allocate_local_port();
+                                    self.pending_acks.insert(ConnMapKey {local_port, peer_port});
+                                    Ok((local_port, peer_port))
+                                }
+                            }
+                        })
                         .and_then(|(local_port, peer_port)| {
                             self.add_connection(
                                 ConnMapKey {
@@ -410,7 +441,7 @@ impl VsockMuxer {
     }
 
     /// Parse a host "connect" command, and extract the destination vsock port.
-    fn read_local_stream_port(stream: &mut UnixStream) -> Result<u32> {
+    fn read_local_cmd(stream: &mut UnixStream) -> Result<LocalCmd> {
         let mut buf = [0u8; 32];
 
         // This is the minimum number of bytes that we should be able to read, when parsing a
@@ -437,19 +468,30 @@ impl VsockMuxer {
             .map_err(|_| Error::InvalidPortRequest)?
             .split_whitespace();
 
-        word_iter
+        let (verb, port) = word_iter
             .next()
             .ok_or(Error::InvalidPortRequest)
             .and_then(|word| {
-                if word.to_lowercase() == "connect" {
-                    Ok(())
-                } else {
-                    Err(Error::InvalidPortRequest)
+                let _verb = word.to_lowercase();
+                match word.to_lowercase().as_str() {
+                    "connect" | "upgrade" => Ok(_verb),
+                    _ => Err(Error::InvalidPortRequest),
                 }
             })
-            .and_then(|_| word_iter.next().ok_or(Error::InvalidPortRequest))
-            .and_then(|word| word.parse::<u32>().map_err(|_| Error::InvalidPortRequest))
-            .map_err(|_| Error::InvalidPortRequest)
+            .and_then(|verb| {
+                word_iter
+                    .next()
+                    .ok_or(Error::InvalidPortRequest)
+                    .and_then(|word| word.parse::<u32>().map_err(|_| Error::InvalidPortRequest))
+                    .map(|port| (verb, port))
+            })
+            .map_err(|_| Error::InvalidPortRequest)?;
+
+        match verb.as_str() {
+            "connect" => Ok(LocalCmd::Connect(port)),
+            "upgrade" => Ok(LocalCmd::Upgrade(port)),
+            _ => Err(Error::InvalidPortRequest),
+        }
     }
 
     /// Add a new connection to the active connection pool.
@@ -493,6 +535,7 @@ impl VsockMuxer {
         if let Some(conn) = self.conn_map.remove(&key) {
             self.remove_listener(conn.get_polled_fd());
         }
+        self.pending_acks.remove(&key);
         self.free_local_port(key.local_port);
     }
 
@@ -625,8 +668,19 @@ impl VsockMuxer {
         if let Some(conn) = self.conn_map.get_mut(&key) {
             let had_rx = conn.has_pending_rx();
             let was_expiring = conn.will_expire();
+            let prev_state = conn.state();
 
             mut_fn(conn);
+
+            // If the host end requested to be notified about the status of their connect() call,
+            // we'll have to pass the good news on to them.
+            if prev_state == ConnState::LocalInit
+                && self.pending_acks.contains(&key)
+                && conn.state() == ConnState::Established {
+                conn.send_bytes(b"101 Switching Protocols\n")
+                    .unwrap_or_else(|_| conn.kill());
+                self.pending_acks.remove(&key);
+            }
 
             // If the connection wasn't previously scheduled for RX, add it to our RX queue.
             if !had_rx && conn.has_pending_rx() {
